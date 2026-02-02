@@ -480,18 +480,33 @@ async function ensureUpstreamSession(upstream) {
   const cached = sessionCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) return cached.sessionId
 
-  const initResponse = await sendRpc(upstream, {
-    jsonrpc: '2.0',
-    id: Date.now(),
-    method: 'initialize',
-    params: {
-      protocolVersion: '2024-11-05',
-      capabilities: { tools: {} },
-      clientInfo: { name: 'mcp-orchestrator', version: '0.1.0' },
-    },
-  }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS)
+  let sessionId = null
+  try {
+    const initResponse = await sendRpc(upstream, {
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        clientInfo: { name: 'mcp-orchestrator', version: '0.1.0' },
+      },
+    }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS)
 
-  const sessionId = initResponse?.sessionId || initResponse?.headers?.['mcp-session-id'] || null
+    // Extract session ID from response header (per MCP spec, stateful servers set this)
+    sessionId = initResponse?.sessionId || null
+
+    // Check if upstream returned an error in the JSON-RPC response
+    if (initResponse?.data?.error) {
+      console.warn(`[orchestrator] initialize error from ${upstream.name || upstream.url}: ${initResponse.data.error.message || 'unknown'}`)
+      // Still continue — some servers may accept tools/call without init
+    }
+  } catch (initErr) {
+    console.warn(`[orchestrator] initialize failed for ${upstream.name || upstream.url}: ${initErr instanceof Error ? initErr.message : 'unknown'}`)
+    // Continue without session — stateless servers or wrappers may still work
+    return null
+  }
+
   if (sessionId) {
     sessionCache.set(cacheKey, {
       sessionId,
@@ -499,7 +514,7 @@ async function ensureUpstreamSession(upstream) {
     })
   }
 
-  // Send initialized notification
+  // Send initialized notification (per MCP spec, client MUST send this after initialize)
   await sendRpc(upstream, {
     jsonrpc: '2.0',
     method: 'notifications/initialized',
@@ -512,7 +527,7 @@ async function ensureUpstreamSession(upstream) {
     method: 'tools/list',
     params: {},
   }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId).catch((err) => {
-    console.warn(`[orchestrator] tools/list warmup failed for ${upstream.name || upstream.url}: ${err.message}`)
+    console.warn(`[orchestrator] tools/list warmup failed for ${upstream.name || upstream.url}: ${err instanceof Error ? err.message : 'unknown'}`)
   })
 
   return sessionId
@@ -1062,7 +1077,7 @@ async function handleToolCall(req, body) {
   if (response.data?.error) {
     const errMsg = (response.data.error.message || '').toLowerCase()
     const errCode = response.data.error.code
-    const isSessionError = errMsg.includes('tool not found') || errMsg.includes('session') || errCode === -32601 || errCode === -32603
+    const isSessionError = errMsg.includes('tool not found') || errMsg.includes('session') || errMsg.includes('invalid') || errCode === -32000 || errCode === -32601 || errCode === -32603
     if (isSessionError) {
       console.log(`[MCP Orchestrator] Session error for ${toolName}, retrying with fresh session...`)
       const cacheKey = normalizeKey(upstream.cacheKey || upstream.name || upstream.url)
@@ -1155,6 +1170,32 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+async function handleToolsList(req, body) {
+  const id = body.id ?? null
+  const integrationName = extractIntegrationHeader(req, 'x-mcp-integration-name')
+  const integrationId = extractIntegrationHeader(req, 'x-mcp-integration-id')
+
+  // If a specific integration is targeted, forward tools/list to that upstream
+  if (integrationName || integrationId) {
+    const upstream = await resolveUpstream(req, null)
+    if (upstream) {
+      const sessionId = await ensureUpstreamSession(upstream)
+      const response = await sendRpc(upstream, {
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'tools/list',
+        params: body.params || {},
+      }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
+      if (response.data?.result) {
+        return buildJsonRpcResult(id, response.data.result)
+      }
+    }
+  }
+
+  // If no specific integration or upstream not found, return empty tools list
+  return buildJsonRpcResult(id, { tools: [] })
+}
+
 async function dispatchRequest(req, body) {
   if (!body || typeof body !== 'object') {
     return buildJsonRpcError(null, 'Invalid request body', -32600)
@@ -1174,8 +1215,17 @@ async function dispatchRequest(req, body) {
     return handleToolCall(req, body)
   }
 
+  if (method === 'tools/list') {
+    return handleToolsList(req, body)
+  }
+
   if (method === 'notifications/initialized') {
     return buildJsonRpcResult(body.id ?? null, { ok: true })
+  }
+
+  // Per MCP spec: ping must be supported
+  if (method === 'ping') {
+    return buildJsonRpcResult(body.id ?? null, {})
   }
 
   return buildJsonRpcError(body.id ?? null, `Unsupported method ${method}`, -32601)
