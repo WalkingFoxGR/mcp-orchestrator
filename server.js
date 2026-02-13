@@ -434,12 +434,24 @@ async function resolveUpstream(req, toolName) {
   const nameHeader = extractIntegrationHeader(req, 'x-mcp-integration-name')
   const idHeader = extractIntegrationHeader(req, 'x-mcp-integration-id')
   const cacheKey = normalizeKey(idHeader || nameHeader)
-  let upstream = getCachedIntegration(cacheKey)
-  if (!upstream) {
-    upstream = upstreamMap.get(normalizeKey(nameHeader))
+  let upstream = null
+
+  // Prefer integration ID resolution first to avoid collisions when multiple
+  // integrations share the same human-readable name.
+  if (idHeader) {
+    upstream = getCachedIntegration(normalizeKey(idHeader))
+    if (!upstream) {
+      upstream = upstreamMap.get(normalizeKey(idHeader))
+    }
   }
-  if (!upstream && idHeader) {
-    upstream = upstreamMap.get(normalizeKey(idHeader))
+  if (!upstream && nameHeader) {
+    upstream = getCachedIntegration(normalizeKey(nameHeader))
+    if (!upstream) {
+      upstream = upstreamMap.get(normalizeKey(nameHeader))
+    }
+  }
+  if (!upstream && cacheKey) {
+    upstream = getCachedIntegration(cacheKey)
   }
   if (!upstream && AUTO_DISCOVER_UPSTREAMS && supabase && (idHeader || nameHeader)) {
     const integration = await fetchIntegrationConfig(idHeader, nameHeader)
@@ -494,7 +506,7 @@ async function ensureUpstreamSession(upstream) {
     }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS)
 
     // Extract session ID from response header (per MCP spec, stateful servers set this)
-    sessionId = initResponse?.sessionId || null
+    sessionId = initResponse?.sessionId || initResponse?.headers?.['mcp-session-id'] || null
 
     // Check if upstream returned an error in the JSON-RPC response
     if (initResponse?.data?.error) {
@@ -514,7 +526,7 @@ async function ensureUpstreamSession(upstream) {
     })
   }
 
-  // Send initialized notification (per MCP spec, client MUST send this after initialize)
+  // Send initialized notification
   await sendRpc(upstream, {
     jsonrpc: '2.0',
     method: 'notifications/initialized',
@@ -1123,6 +1135,57 @@ async function handleToolCall(req, body) {
   return buildJsonRpcResult(id, result)
 }
 
+async function handleToolsList(req, body) {
+  const id = body.id ?? null
+  const params = body.params || {}
+  const integrationName = extractIntegrationHeader(req, 'x-mcp-integration-name')
+  const integrationId = extractIntegrationHeader(req, 'x-mcp-integration-id')
+  const integrationLabel = integrationName || integrationId || 'unknown'
+  console.log(`[MCP Orchestrator] tools/list integration=${integrationLabel}`)
+
+  const upstream = await resolveUpstream(req, '')
+  if (!upstream) {
+    return buildJsonRpcError(id, `No upstream configured for integration ${integrationLabel}`, -32601)
+  }
+
+  let sessionId = await ensureUpstreamSession(upstream)
+  const rpc = {
+    jsonrpc: '2.0',
+    id: Date.now(),
+    method: 'tools/list',
+    params,
+  }
+
+  let response = await sendRpc(upstream, rpc, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
+
+  if (response.data?.error) {
+    const errMsg = (response.data.error.message || '').toLowerCase()
+    const errCode = response.data.error.code
+    const isSessionError = errMsg.includes('session') || errCode === -32603
+    if (isSessionError) {
+      const cacheKey = normalizeKey(upstream.cacheKey || upstream.name || upstream.url)
+      sessionCache.delete(cacheKey)
+      sessionId = await ensureUpstreamSession(upstream)
+      rpc.id = Date.now()
+      response = await sendRpc(upstream, rpc, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
+    }
+  }
+
+  if (!response.data) {
+    return buildJsonRpcError(id, `Upstream ${upstream.name || 'MCP'} returned no data`, -32000)
+  }
+
+  if (response.data.error) {
+    return buildJsonRpcError(
+      id,
+      response.data.error.message || 'Upstream tools/list error',
+      response.data.error.code || -32000
+    )
+  }
+
+  return buildJsonRpcResult(id, response.data.result || { tools: [] })
+}
+
 async function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = ''
@@ -1169,32 +1232,6 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: message }))
   }
 })
-
-async function handleToolsList(req, body) {
-  const id = body.id ?? null
-  const integrationName = extractIntegrationHeader(req, 'x-mcp-integration-name')
-  const integrationId = extractIntegrationHeader(req, 'x-mcp-integration-id')
-
-  // If a specific integration is targeted, forward tools/list to that upstream
-  if (integrationName || integrationId) {
-    const upstream = await resolveUpstream(req, null)
-    if (upstream) {
-      const sessionId = await ensureUpstreamSession(upstream)
-      const response = await sendRpc(upstream, {
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'tools/list',
-        params: body.params || {},
-      }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
-      if (response.data?.result) {
-        return buildJsonRpcResult(id, response.data.result)
-      }
-    }
-  }
-
-  // If no specific integration or upstream not found, return empty tools list
-  return buildJsonRpcResult(id, { tools: [] })
-}
 
 async function dispatchRequest(req, body) {
   if (!body || typeof body !== 'object') {
