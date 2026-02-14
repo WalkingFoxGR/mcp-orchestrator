@@ -63,7 +63,6 @@ const TOOL_SCHEMAS = {
     timeout: 50000,
   },
 }
-const DEFAULT_LIST_FIELDS = ['id', 'name', 'type', 'url', 'status']
 for (const upstream of UPSTREAMS) {
   if (upstream && upstream.name) {
     upstreamMap.set(normalizeKey(upstream.name), upstream)
@@ -104,19 +103,6 @@ function parseJsonValue(value) {
   return value
 }
 
-function extractListCandidate(value) {
-  const parsed = parseJsonValue(value)
-  if (Array.isArray(parsed)) return parsed
-  if (parsed && typeof parsed === 'object') {
-    const record = parsed
-    const keys = ['data', 'items', 'results']
-    for (const key of keys) {
-      const nested = parseJsonValue(record[key])
-      if (Array.isArray(nested)) return nested
-    }
-  }
-  return null
-}
 
 function getApifyCacheKey(integrationId, integrationName) {
   const raw = integrationId || integrationName || ''
@@ -772,111 +758,6 @@ function summarizeToolResult(result) {
   return null
 }
 
-function normalizeToolOutput(toolName, result) {
-  const schema = findToolSchema(toolName)
-
-  if (result === null || result === undefined) {
-    return { success: false, type: 'raw', error: 'No result' }
-  }
-
-  const parsed = parseJsonValue(result)
-  if (typeof parsed === 'string') {
-    return { success: true, type: 'raw', data: parsed }
-  }
-
-  if (Array.isArray(parsed)) {
-    return normalizeToolList(parsed, schema)
-  }
-
-  if (parsed && typeof parsed === 'object') {
-    const record = parsed
-    const list = extractListCandidate(record.data)
-      || extractListCandidate(record.items)
-      || extractListCandidate(record.results)
-    if (list) {
-      const normalized = normalizeToolList(list, schema)
-      return { ...normalized, data: record }
-    }
-  }
-
-  return { success: true, type: 'single', data: parsed }
-}
-
-function normalizeToolList(items, schema) {
-  const fields = (schema && schema.listItemFields) || DEFAULT_LIST_FIELDS
-  const normalizedItems = items.map((item, index) => {
-    if (!item || typeof item !== 'object') {
-      return { _index: index + 1, value: item }
-    }
-
-    const record = item
-    const normalized = { _index: index + 1 }
-
-    if (record.id !== undefined) {
-      normalized.id = String(record.id)
-    }
-
-    for (const field of fields) {
-      if (record[field] === undefined) continue
-      const value = record[field]
-      if (typeof value === 'string' && value.length > 200) {
-        normalized[field] = `${value.slice(0, 200)}...`
-      } else {
-        normalized[field] = value
-      }
-    }
-
-    return normalized
-  })
-
-  return {
-    success: true,
-    type: 'list',
-    totalCount: items.length,
-    shownCount: normalizedItems.length,
-    items: normalizedItems,
-  }
-}
-
-function renderToolList(output) {
-  if (!output || output.type !== 'list' || !Array.isArray(output.items)) {
-    return JSON.stringify(output?.data ?? output ?? {})
-  }
-
-  const items = output.items
-  if (items.length === 0) return 'No items found.'
-
-  const fieldSet = new Set()
-  fieldSet.add('_index')
-  for (const item of items) {
-    Object.keys(item || {}).forEach((key) => fieldSet.add(key))
-  }
-  const fields = Array.from(fieldSet).filter((field) => field !== '_index')
-  fields.unshift('#')
-
-  const header = `| ${fields.join(' | ')} |`
-  const divider = `| ${fields.map(() => '---').join(' | ')} |`
-
-  const rows = items.map((item) => {
-    const cells = fields.map((field) => {
-      if (field === '#') return String(item._index)
-      const value = item[field]
-      if (value === undefined) return ''
-      return String(value).replace(/\|/g, '\\|').replace(/\n/g, ' ')
-    })
-    return `| ${cells.join(' | ')} |`
-  })
-
-  const total = output.totalCount ?? items.length
-  return [
-    `**Total: ${total} items**`,
-    '',
-    header,
-    divider,
-    ...rows,
-  ].join('\n')
-}
-
 function extractResultPayload(result) {
   if (!result || typeof result !== 'object') return { value: result, text: '' }
   if (result.structuredContent !== undefined) {
@@ -891,23 +772,6 @@ function extractResultPayload(result) {
     return { value: text, text }
   }
   return { value: result, text: JSON.stringify(result) }
-}
-
-function applyReliabilityLayer(toolName, upstreamResult) {
-  if (!upstreamResult || typeof upstreamResult !== 'object') return upstreamResult
-  if (upstreamResult.isError) return upstreamResult
-
-  const payload = extractResultPayload(upstreamResult)
-  const normalized = normalizeToolOutput(toolName, payload.value)
-  const rendered = normalized.type === 'list'
-    ? renderToolList(normalized)
-    : JSON.stringify(normalized)
-
-  return {
-    ...upstreamResult,
-    structuredContent: normalized,
-    content: [{ type: 'text', text: rendered }],
-  }
 }
 
 async function cachePayload(payload, meta) {
