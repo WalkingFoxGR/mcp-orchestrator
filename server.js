@@ -526,14 +526,13 @@ async function ensureUpstreamSession(upstream) {
     })
   }
 
-  // Send initialized notification
-  await sendRpc(upstream, {
+  // Run notification + tools/list in parallel to reduce handshake time
+  const notifPromise = sendRpc(upstream, {
     jsonrpc: '2.0',
     method: 'notifications/initialized',
   }, 5000, sessionId).catch(() => null)
 
-  // Warmup: call tools/list so stateful servers register tool availability for this session
-  await sendRpc(upstream, {
+  const listPromise = sendRpc(upstream, {
     jsonrpc: '2.0',
     id: Date.now() + 1,
     method: 'tools/list',
@@ -541,6 +540,8 @@ async function ensureUpstreamSession(upstream) {
   }, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId).catch((err) => {
     console.warn(`[orchestrator] tools/list warmup failed for ${upstream.name || upstream.url}: ${err instanceof Error ? err.message : 'unknown'}`)
   })
+
+  await Promise.allSettled([notifPromise, listPromise])
 
   return sessionId
 }
