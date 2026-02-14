@@ -934,15 +934,17 @@ async function cachePayload(payload, meta) {
 }
 
 async function normalizeUpstreamResult(toolName, upstreamResult) {
-  const reliableResult = applyReliabilityLayer(toolName, upstreamResult)
-  const payload = extractResultPayload(reliableResult)
+  // Pass through the raw upstream result — the orchestrator should be transparent.
+  // Only intervene when the result exceeds the size limit (cache + truncate).
+  const payload = extractResultPayload(upstreamResult)
   const resultText = payload.text || (typeof payload.value === 'string' ? payload.value : JSON.stringify(payload.value))
-  if (!resultText) return reliableResult
+  if (!resultText) return upstreamResult
 
   if (Buffer.byteLength(resultText, 'utf8') <= MAX_RESULT_BYTES) {
-    return reliableResult
+    return upstreamResult
   }
 
+  // Result too large — cache the full payload in Supabase and return a truncated preview
   const summary = summarizeToolResult(resultText)
   const summaryPayload = summary ? parseJson(summary) || summary : resultText.slice(0, 2000)
   const cachedId = await cachePayload({ toolName, result: payload.value }, { toolName, truncated: true })
@@ -957,7 +959,7 @@ async function normalizeUpstreamResult(toolName, upstreamResult) {
   wrapped._originalSize = Buffer.byteLength(resultText, 'utf8')
 
   return {
-    ...reliableResult,
+    ...upstreamResult,
     structuredContent: wrapped,
     content: [{ type: 'text', text: JSON.stringify(wrapped) }],
   }
