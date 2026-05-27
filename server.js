@@ -2,7 +2,7 @@ import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 
 const PORT = Number(process.env.PORT || 3000)
-const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS || 50000)
+const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 minutes — guard against NaN/empty/"0" by parsing first then defaulting
 const MAX_ARG_BYTES = Number(process.env.ORCH_MAX_ARG_BYTES || 65536)
 const MAX_RESULT_BYTES = Number(process.env.ORCH_MAX_RESULT_BYTES || 200000)
 const STREAM_RESPONSES = process.env.ORCH_STREAM === 'true'
@@ -689,6 +689,10 @@ function summarizeToolItem(item) {
     'title',
     'shortCode',
     'url',
+    'link',
+    'webViewLink',
+    'webContentLink',
+    'htmlLink',
     'status',
     'createdAt',
     'updatedAt',
@@ -696,6 +700,7 @@ function summarizeToolItem(item) {
     'likesCount',
     'commentsCount',
     'type',
+    'mimeType',
   ]
 
   for (const key of preferredKeys) {
@@ -1088,6 +1093,83 @@ const server = http.createServer(async (req, res) => {
     if (Array.isArray(payload)) {
       const results = await Promise.all(payload.map((item) => dispatchRequest(req, item)))
       respond(res, results, preferStream)
+      return
+    }
+
+    // Streaming path with keepalive: open SSE response BEFORE awaiting the
+    // upstream tool call, write ": keepalive\n\n" comments every 20s while we
+    // wait, then write the final JSON-RPC result when the dispatch completes.
+    // This prevents intermediary proxies (Railway edge, undici, MCP SDK
+    // transport) from classifying the long-running connection as idle and
+    // dropping it at ~90-150s. Generic — applies to ANY MCP tool routed
+    // through this orchestrator. Comments (lines starting with `:`) are SSE
+    // spec-compliant no-ops on the client side; they keep TCP active without
+    // delivering any spurious data to the client.
+    if (preferStream && payload?.method === 'tools/call') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no', // hint to disable proxy buffering where supported
+      })
+      if (typeof res.flushHeaders === 'function') res.flushHeaders()
+
+      let keepaliveInterval = setInterval(() => {
+        if (!res.writableEnded && !res.destroyed) {
+          try { res.write(': keepalive\n\n') } catch { /* connection probably gone */ }
+        }
+      }, 20000)
+
+      let clientDisconnected = false
+      let dispatchAbandoned = false
+      const cleanupKeepalive = () => {
+        if (keepaliveInterval) {
+          clearInterval(keepaliveInterval)
+          keepaliveInterval = null
+        }
+      }
+      // Codex review fix #1: react to client/socket close IMMEDIATELY, not
+      // when dispatch settles. Tied to res.close (which fires on socket
+      // disconnect for the response side), not req.close.
+      const onResponseClose = () => {
+        clientDisconnected = true
+        cleanupKeepalive()
+      }
+      res.on('close', onResponseClose)
+
+      // Codex review fix #2: hard ceiling so a permanently stuck dispatch
+      // can't pin the keepalive interval forever. Mirrors the Nexus-side
+      // MCP_TOOL_TIMEOUT_MS default of 900s.
+      const HARD_TIMEOUT_MS = Number(process.env.STREAM_HARD_TIMEOUT_MS) || 900_000
+      const hardTimeoutHandle = setTimeout(() => {
+        dispatchAbandoned = true
+        cleanupKeepalive()
+        if (!res.writableEnded && !res.destroyed) {
+          const errPayload = buildJsonRpcError(
+            payload?.id ?? null,
+            `Orchestrator hard timeout after ${Math.round(HARD_TIMEOUT_MS / 1000)}s`,
+            -32000,
+          )
+          try { res.end(`data: ${JSON.stringify(errPayload)}\n\n`) } catch { /* ignore */ }
+        }
+      }, HARD_TIMEOUT_MS)
+
+      try {
+        const result = await dispatchRequest(req, payload)
+        cleanupKeepalive()
+        clearTimeout(hardTimeoutHandle)
+        res.off('close', onResponseClose)
+        if (clientDisconnected || dispatchAbandoned || res.writableEnded || res.destroyed) return
+        res.end(`data: ${JSON.stringify(result)}\n\n`)
+      } catch (error) {
+        cleanupKeepalive()
+        clearTimeout(hardTimeoutHandle)
+        res.off('close', onResponseClose)
+        if (clientDisconnected || dispatchAbandoned || res.writableEnded || res.destroyed) return
+        const message = error instanceof Error ? error.message : 'Unknown error'
+        const errorPayload = buildJsonRpcError(payload?.id ?? null, message, -32000)
+        try { res.end(`data: ${JSON.stringify(errorPayload)}\n\n`) } catch { /* ignore */ }
+      }
       return
     }
 
