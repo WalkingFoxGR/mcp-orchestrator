@@ -1,8 +1,24 @@
 import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
+import { Agent } from 'undici'
 
 const PORT = Number(process.env.PORT || 3000)
 const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 minutes — guard against NaN/empty/"0" by parsing first then defaulting
+
+// Node's global fetch (undici) enforces headersTimeout=300s AND bodyTimeout=300s
+// by DEFAULT, INDEPENDENTLY of AbortSignal.timeout(). For long-running upstream
+// tools (e.g. generate_article: writer + evaluator + retries + length-recall can
+// exceed 5 min) undici silently kills the socket at ~300s mid-flight — the
+// upstream keeps working on an orphaned request while we surface "-32000
+// terminated". Raising ORCH_TIMEOUT_MS does nothing because it only feeds the
+// AbortSignal, not these two timers. Disable both here and rely solely on
+// AbortSignal.timeout(timeoutMs) for the real overall cap. Connect timeout stays
+// bounded so a dead host fails fast instead of hanging for the full timeout.
+const upstreamDispatcher = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+  connect: { timeout: 30_000 },
+})
 const MAX_ARG_BYTES = Number(process.env.ORCH_MAX_ARG_BYTES || 65536)
 const MAX_RESULT_BYTES = Number(process.env.ORCH_MAX_RESULT_BYTES || 200000)
 const STREAM_RESPONSES = process.env.ORCH_STREAM === 'true'
@@ -842,12 +858,29 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
   }
   if (sessionId) headers['mcp-session-id'] = sessionId
 
-  const res = await fetch(upstream.url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(message),
-    signal: AbortSignal.timeout(timeoutMs),
-  })
+  // Observability: log duration + outcome for every upstream RPC. The previous
+  // build only logged the INCOMING tools/call, leaving us blind to whether the
+  // upstream succeeded, errored, or had its socket killed (and after how long).
+  const startedAt = Date.now()
+  const rpcLabel = message?.method === 'tools/call'
+    ? `tools/call ${message?.params?.name || '?'}`
+    : (message?.method || 'rpc')
+  const elapsed = () => `${((Date.now() - startedAt) / 1000).toFixed(1)}s`
+
+  let res
+  try {
+    res = await fetch(upstream.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(message),
+      signal: AbortSignal.timeout(timeoutMs),
+      dispatcher: upstreamDispatcher,
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[MCP Orchestrator] upstream ${rpcLabel} FAILED after ${elapsed()} (${upstream.name || upstream.url}): ${msg}`)
+    throw err
+  }
 
   const nextSessionId = res.headers.get('mcp-session-id')
   const contentType = res.headers.get('content-type') || ''
@@ -870,6 +903,9 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
     const text = await res.text()
     data = parseJson(text) || null
   }
+
+  const jsonRpcError = data?.error ? ` jsonrpc-error="${(data.error.message || '').slice(0, 120)}"` : ''
+  console.log(`[MCP Orchestrator] upstream ${rpcLabel} -> HTTP ${res.status} in ${elapsed()}${jsonRpcError}`)
 
   return { data, sessionId: nextSessionId, status: res.status }
 }
