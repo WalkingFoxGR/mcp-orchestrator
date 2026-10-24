@@ -2,11 +2,14 @@ import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 import { Agent } from 'undici'
 import {
-  checkInboundKey,
+  apifyCacheKey,
+  createInboundGuard,
+  createRateLimitedLog,
   createResolver,
-  inboundKeyWarning,
   integrationIdOf,
   logLabel,
+  oauthTokenCacheKey,
+  parseInboundKeys,
   sessionKeyFor,
 } from './lib/resolve.js'
 
@@ -38,9 +41,15 @@ const SUPABASE_INTEGRATIONS_CACHE_TTL_MS = Number(process.env.SUPABASE_INTEGRATI
 const AUTO_DISCOVER_UPSTREAMS = process.env.ORCH_AUTO_DISCOVER !== 'false'
 const UPSTREAMS = parseJson(process.env.MCP_UPSTREAMS || process.env.UPSTREAMS || '[]') || []
 const APIFY_DATASET_CACHE_TTL_MS = Number(process.env.APIFY_DATASET_CACHE_TTL_MS || 600000)
-// Every request but GET/HEAD /health must carry x-orchestrator-key equal to this (lib/resolve.js).
-// Unset: everything is accepted, with a warning at startup.
-const ORCH_INBOUND_KEY = process.env.ORCH_INBOUND_KEY || ''
+// Every request but GET/HEAD /health must carry x-orchestrator-key equal to one of these
+// (comma-separated while rotating). Unset with a service key configured: every request is
+// refused, unless ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+const inboundGuard = createInboundGuard({
+  keys: parseInboundKeys(process.env.ORCH_INBOUND_KEY),
+  serviceKeyConfigured: Boolean(SUPABASE_KEY),
+  allowUnauthenticated: process.env.ORCH_ALLOW_UNAUTHENTICATED === 'true',
+})
+const logRefusal = createRateLimitedLog()
 
 const supabase = SUPABASE_URL && SUPABASE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } })
@@ -119,11 +128,6 @@ function parseJsonValue(value) {
   return value
 }
 
-
-// By integration id only: a name is not unique across tenants.
-function getApifyCacheKey(integrationId) {
-  return integrationId ? `id:${integrationId}` : 'default'
-}
 
 function isApifyToolContext(toolName, integrationLabel) {
   const label = `${integrationLabel || ''} ${toolName || ''}`.toLowerCase()
@@ -357,9 +361,7 @@ async function buildAuthHeaders(config, integrationId = '') {
     const tokenType = config.oauthTokenType || 'Bearer'
     headers.Authorization = `${tokenType} ${config.oauthAccessToken}`
   } else if (authType === 'oauth_client_credentials') {
-    // Per integration: another row naming the same client must not get this row's token.
-    const cacheKey = `${integrationId}_${config.oauthTokenUrl || ''}_${config.oauthClientId || ''}`
-    const token = await getOAuthToken(cacheKey, config)
+    const token = await getOAuthToken(oauthTokenCacheKey(integrationId, config), config)
     if (token) headers.Authorization = `Bearer ${token}`
   }
 
@@ -377,10 +379,8 @@ async function fetchIntegrationById(integrationId) {
     .select('id,name,config,integration_type,is_active,is_verified,updated_at')
     .eq('id', integrationId)
     .maybeSingle()
-  if (error) {
-    console.error('[MCP Orchestrator] Integration lookup failed:', error.message)
-    return null
-  }
+  // A read error throws, so the resolver can tell it from a missing row.
+  if (error) throw new Error(error.message || 'Integration lookup failed')
   return data || null
 }
 
@@ -397,7 +397,8 @@ const resolver = createResolver({
 
 const UNRESOLVED = {
   bad_id: ['x-mcp-integration-id is not a valid integration id', -32602],
-  not_found: ['No active MCP integration with that x-mcp-integration-id', -32601],
+  not_found: ['No MCP integration with that x-mcp-integration-id', -32601],
+  lookup_failed: ['The MCP integration could not be read just now; try again', -32603],
 }
 
 /** The JSON-RPC error for a request whose upstream did not resolve. */
@@ -859,13 +860,13 @@ async function handleToolCall(req, body) {
   const integrationLabel = integrationLabelOf(req)
   // The name header only tells whether this looks like Apify (its run and dataset ids are cached by integration id).
   const integrationHint = `${logLabel(extractIntegrationHeader(req, 'x-mcp-integration-name'))} ${integrationLabel}`
-  const apifyCacheKey = getApifyCacheKey(integrationId)
+  const apifyKey = apifyCacheKey(integrationId)
   console.log(`[MCP Orchestrator] tools/call ${logLabel(toolName)} integration=${integrationLabel}`)
   let args = parseToolArguments(params.arguments || params.args || {})
   args = normalizeCreateWorkflowArgs(toolName, args)
   if (isApifyGetActorOutputTool(toolName)) {
-    const cachedDatasetId = getCachedApifyDatasetId(apifyCacheKey)
-    const cachedRunId = getCachedApifyRunId(apifyCacheKey)
+    const cachedDatasetId = getCachedApifyDatasetId(apifyKey)
+    const cachedRunId = getCachedApifyRunId(apifyKey)
     const datasetArg = args?.datasetId
     const needsInjection = isPlaceholderDatasetId(datasetArg)
       || (cachedRunId && cachedDatasetId && String(datasetArg).trim() === String(cachedRunId).trim())
@@ -878,7 +879,7 @@ async function handleToolCall(req, body) {
   }
 
   if (isApifyGetActorRunTool(toolName) && (!args?.runId || String(args.runId).trim() === '')) {
-    const cachedRunId = getCachedApifyRunId(apifyCacheKey)
+    const cachedRunId = getCachedApifyRunId(apifyKey)
     if (cachedRunId) {
       args = { ...args, runId: cachedRunId }
       console.log(`[MCP Orchestrator] Injected cached Apify run ID for ${toolName}`)
@@ -948,7 +949,7 @@ async function handleToolCall(req, body) {
         datasetId = extractApifyDatasetId(result)
       }
       if (datasetId) {
-        setCachedApifyDatasetId(apifyCacheKey, datasetId)
+        setCachedApifyDatasetId(apifyKey, datasetId)
         console.log(`[MCP Orchestrator] Cached Apify dataset ID ${datasetId}`)
       }
       let runId = extractApifyRunId(payload.value)
@@ -956,7 +957,7 @@ async function handleToolCall(req, body) {
         runId = extractApifyRunId(result)
       }
       if (runId) {
-        setCachedApifyRunId(apifyCacheKey, runId)
+        setCachedApifyRunId(apifyKey, runId)
         console.log(`[MCP Orchestrator] Cached Apify run ID ${runId}`)
       }
     }
@@ -1035,9 +1036,10 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  const inbound = checkInboundKey(req.headers, ORCH_INBOUND_KEY)
+  const inbound = inboundGuard.check(req.headers)
   if (!inbound.ok) {
-    console.warn(`[MCP Orchestrator] 401 ${req.method} ${logLabel(req.url)}: inbound key ${inbound.reason}`)
+    const from = req.socket?.remoteAddress || 'unknown'
+    logRefusal(from, `[MCP Orchestrator] 401 ${req.method} ${logLabel(req.url)} from ${logLabel(from)}: inbound key ${inbound.reason}`)
     res.writeHead(401, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: 'Unauthorized' }))
     return
@@ -1184,7 +1186,6 @@ async function dispatchRequest(req, body) {
 server.listen(PORT, () => {
   console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
-  const warning = inboundKeyWarning(ORCH_INBOUND_KEY)
-  if (warning) console.warn(warning)
-  else console.log('[MCP Orchestrator] Inbound key required on every request but /health')
+  if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
+  else console.warn(inboundGuard.startupLine)
 })
