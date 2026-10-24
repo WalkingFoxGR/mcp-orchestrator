@@ -12,6 +12,7 @@ import {
   isAllowed,
   isPrivateIp,
   parseAllowedHosts,
+  parseOwnHosts,
   refusalIn,
 } from '../lib/upstream-guard.js'
 
@@ -269,4 +270,26 @@ test('through a real undici Agent: a name resolving to 127.0.0.1 is refused with
   } finally {
     await dispatcher.close()
   }
+})
+
+test('the orchestrator\'s own names are refused everywhere, before the allow list', async () => {
+  const own = parseOwnHosts(' Orch.up.railway.app. ', 'https://orch.railway.internal:3000/x', '', undefined)
+  assert.deepEqual([...own].sort(), ['orch.railway.internal', 'orch.up.railway.app'])
+  const allowed = parseAllowedHosts('orch.railway.internal:3000,orch.up.railway.app')
+  assert.equal(hostRefusal('orch.up.railway.app', allowed, '443', own), 'the orchestrator itself')
+  assert.equal(hostRefusal('ORCH.railway.internal.', allowed, '3000', own), 'the orchestrator itself')
+  assert.equal(hostRefusal('orch.up.railway.app', allowed, '443'), null)
+  assert.equal(hostRefusal('other.up.railway.app', allowed, '443', own), null)
+  // The lookup refuses it without resolving, allowed or not.
+  const { lookup, calls } = fakeDns({ 'orch.up.railway.app': ['66.33.22.11'] })
+  const lookedUp = await lookupResult(createGuardedLookup({ lookup, allowed, own }), 'orch.up.railway.app')
+  assert.ok(lookedUp.err instanceof UpstreamRefusedError)
+  assert.equal(calls['orch.up.railway.app'], undefined)
+  // A redirect to it is refused before it is fetched.
+  const { impl, asked } = fakeFetch({ 'https://mcp.example.com/mcp': { status: 302, headers: { location: 'https://orch.up.railway.app/' } } })
+  await assert.rejects(
+    guardedFetch('https://mcp.example.com/mcp', { dispatcher: FAKE_DISPATCHER }, { fetchImpl: impl, allowed, own }),
+    (e) => e instanceof UpstreamRefusedError && /the orchestrator itself/.test(e.message),
+  )
+  assert.equal(asked.length, 1)
 })

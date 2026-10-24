@@ -7,6 +7,7 @@ import {
   createGuardedLookup,
   guardedFetch,
   parseAllowedHosts,
+  parseOwnHosts,
   refusalIn,
 } from './lib/upstream-guard.js'
 import {
@@ -36,8 +37,11 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 mi
 // SSRF guard (lib/upstream-guard.js): every upstream connection resolves its host through
 // guardedLookup, which refuses private, internal and metadata addresses and pins the address it
 // checked. ORCH_ALLOW_PRIVATE_UPSTREAMS lists exact hosts that may be private (an internal upstream).
+// The orchestrator's own Railway names are never an upstream, listed or not: a row pointing back at
+// it would call it with that row's custom headers (a self-loop).
 const ALLOWED_PRIVATE_UPSTREAMS = parseAllowedHosts(process.env.ORCH_ALLOW_PRIVATE_UPSTREAMS)
-const guardedLookup = createGuardedLookup({ allowed: ALLOWED_PRIVATE_UPSTREAMS })
+const OWN_HOSTS = parseOwnHosts(process.env.RAILWAY_PUBLIC_DOMAIN, process.env.RAILWAY_PRIVATE_DOMAIN)
+const guardedLookup = createGuardedLookup({ allowed: ALLOWED_PRIVATE_UPSTREAMS, own: OWN_HOSTS })
 const upstreamDispatcher = new Agent({
   headersTimeout: 0,
   bodyTimeout: 0,
@@ -45,7 +49,7 @@ const upstreamDispatcher = new Agent({
 })
 // The token fetch keeps undici's default timers; only the lookup is guarded.
 const tokenDispatcher = new Agent({ connect: { timeout: 15_000, lookup: guardedLookup } })
-const upstreamFetch = (url, init) => guardedFetch(url, init, { allowed: ALLOWED_PRIVATE_UPSTREAMS })
+const upstreamFetch = (url, init) => guardedFetch(url, init, { allowed: ALLOWED_PRIVATE_UPSTREAMS, own: OWN_HOSTS })
 const MAX_ARG_BYTES = Number(process.env.ORCH_MAX_ARG_BYTES || 65536)
 const MAX_RESULT_BYTES = Number(process.env.ORCH_MAX_RESULT_BYTES || 200000)
 const STREAM_RESPONSES = process.env.ORCH_STREAM === 'true'
@@ -58,10 +62,13 @@ const AUTO_DISCOVER_UPSTREAMS = process.env.ORCH_AUTO_DISCOVER !== 'false'
 const UPSTREAMS = parseJson(process.env.MCP_UPSTREAMS || process.env.UPSTREAMS || '[]') || []
 const APIFY_DATASET_CACHE_TTL_MS = Number(process.env.APIFY_DATASET_CACHE_TTL_MS || 600000)
 // Every request but GET/HEAD /health must carry x-orchestrator-key equal to one of these
-// (comma-separated while rotating). Unset with a service key configured: every request is
-// refused, unless ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+// (comma-separated while rotating; an entry under 32 characters is ignored). Unset, or set with no
+// valid entry, with a service key configured: every request is refused, unless
+// ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+const inboundKeys = parseInboundKeys(process.env.ORCH_INBOUND_KEY)
 const inboundGuard = createInboundGuard({
-  keys: parseInboundKeys(process.env.ORCH_INBOUND_KEY),
+  keys: inboundKeys.keys,
+  ignoredKeys: inboundKeys.ignored,
   serviceKeyConfigured: Boolean(SUPABASE_KEY),
   allowUnauthenticated: process.env.ORCH_ALLOW_UNAUTHENTICATED === 'true',
 })
@@ -1218,9 +1225,11 @@ async function dispatchMethod(req, body) {
 }
 
 server.listen(PORT, () => {
-  console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
+  // The bound port, so PORT=0 (tests) says which one it got.
+  console.log(`[MCP Orchestrator] Listening on port ${server.address().port}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
-  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS, ([host, ports]) => logLabel(ports ? `${host}:${[...ports].join('|')}` : `${host} (any port)`)).join(', ') : 'none'}`)
+  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS, ([host, ports]) => logLabel(ports ? `${host}:${[...ports].join('|')}` : `${host} (any port)`)).join(', ') : 'none'}; own hosts refused: ${OWN_HOSTS.size ? Array.from(OWN_HOSTS, logLabel).join(', ') : 'none set'}`)
+  if (inboundGuard.ignoredLine) console.warn(inboundGuard.ignoredLine)
   if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
   else console.warn(inboundGuard.startupLine)
 })

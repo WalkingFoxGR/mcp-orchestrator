@@ -14,16 +14,21 @@ never be reachable by anyone but Nexus.
   the `x-orchestrator-key` header; anything else gets `401 {"error":"Unauthorized"}`. Refusals are
   logged at most once per remote address per minute, with a count of the ones left out; the key is
   never logged. The value is trimmed, and may be a comma-separated list (see Rotating the key).
+  Each key must be at least 32 characters: a shorter entry (a typo such as `<current>,x`) is
+  ignored, with a startup warning that never names it.
 - **Fails closed.** With `ORCH_INBOUND_KEY` unset (or blank) and a Supabase service key configured,
-  every request but `/health` gets 401. Set `ORCH_ALLOW_UNAUTHENTICATED=true` to accept requests
-  without a key anyway (rollback only). The startup log says which mode the service is in.
+  every request but `/health` gets 401. So does a key set with no entry of 32 characters, with or
+  without a service key. `ORCH_ALLOW_UNAUTHENTICATED=true` (exactly `true`) accepts requests
+  without a key anyway; see Rollback order before using it. The startup log says which mode the
+  service is in.
 - **Integrations by id only.** An upstream is resolved from `x-mcp-integration-id` alone: the
   `agent_integrations` row with that id, if it is an MCP row (or an API row with its wrapper enabled)
   and has a URL. `is_active` is not checked: it is the chat toggle, and Nexus decides which rows it
   calls. `x-mcp-integration-name` appears in log lines only. A row is cached by id for
   `SUPABASE_INTEGRATIONS_CACHE_TTL_MS`, so an edited row takes effect within it; if the database
-  cannot be read when the entry expires, the cached row keeps being served (retried every 30 s), and
-  an id with no row is remembered for 10 s. Upstream sessions, client-credentials tokens and Apify
+  cannot be read when the entry expires, the cached row keeps being served (retried every 30 s) for
+  at most an hour after its last good read, and an id with no row is remembered for 10 s.
+  Concurrent requests for one id share one database read. Upstream sessions, client-credentials tokens and Apify
   run ids are kept per integration id.
 
 - **Upstreams must be public.** Every upstream fetch (initialize, tools/list, tools/call, the
@@ -32,7 +37,10 @@ never be reachable by anyone but Nexus.
   local-use NAT64 and documentation IPv6, and IPv4-mapped, NAT64 or 6to4 IPv6 that embeds a refused
   IPv4 (any textual form); cloud metadata (169.254.169.254, fd00:ec2::254); and the hostnames
   `localhost`, `*.localhost`, `*.local`, `*.internal` (Railway's private network) and any
-  single-label name. A name is checked on the addresses the connection actually dials (a guarded
+  single-label name. The orchestrator's own names (`RAILWAY_PUBLIC_DOMAIN`,
+  `RAILWAY_PRIVATE_DOMAIN`, set by Railway) are refused too, even when allow-listed: a row pointing
+  back at the orchestrator would call it with that row's custom headers. A custom domain on this
+  service is not covered; it should have none. A name is checked on the addresses the connection actually dials (a guarded
   lookup on the undici Agent), so DNS rebinding between a check and the connect does not get
   through. Only 301, 302, 303, 307 and 308 are followed, by hand, at most 5, each hop checked again;
   a hop to another origin keeps only `Accept` and `Content-Type`, and a request body never follows
@@ -53,9 +61,19 @@ The upstream guard (branch `fix/upstream-ssrf-guard`) is built on the inbound ke
 and no `MCP_UPSTREAMS` entry points at a private or internal host; an integration that does stops
 working (see the warning above before listing anything).
 
-Rollback order: roll this service back, or set `ORCH_ALLOW_UNAUTHENTICATED=true` and unset
-`ORCH_INBOUND_KEY`, **before** Nexus stops sending the key (a Nexus rollback or an unset
-`MCP_ORCHESTRATOR_KEY`). The other way round, every orchestrator call is refused.
+Rollback order. Prefer fixing forward: if calls are refused for a key mismatch, re-sync the key
+(the same value in `ORCH_INBOUND_KEY` here and `MCP_ORCHESTRATOR_KEY` in Nexus) instead of rolling
+back. Both rollbacks reopen a cross-tenant path that any signed-in Nexus user can drive: a tenant's
+own MCP row whose url is this orchestrator, with custom headers naming another tenant's row, makes
+the orchestrator call itself and answer with the other tenant's credentials. The key is what stops
+it (the self-call never carries it).
+
+- If a rollback is forced, prefer `ORCH_ALLOW_UNAUTHENTICATED=true` with `ORCH_INBOUND_KEY` unset
+  over a revert: resolution by id only stays, so the self-loop needs the other row's full uuid,
+  and the upstream guard keeps refusing the orchestrator's own names. A revert brings back
+  resolution by name, where the other tenant's integration name alone is enough.
+- Either way, do it **before** Nexus stops sending the key (a Nexus rollback or an unset
+  `MCP_ORCHESTRATOR_KEY`). The other way round, every orchestrator call is refused.
 
 ### Rotating the key
 
@@ -69,9 +87,9 @@ Rollback order: roll this service back, or set `ORCH_ALLOW_UNAUTHENTICATED=true`
 2) Deploy from GitHub and set the root to `mcp-orchestrator/`. Do not generate a public domain.
 3) Set environment variables:
    - `PORT`: `3000`
-- `ORCH_INBOUND_KEY`: the key every request but `/health` must carry in `x-orchestrator-key`; comma-separated while rotating (see Security).
+- `ORCH_INBOUND_KEY`: the key every request but `/health` must carry in `x-orchestrator-key`, at least 32 characters; comma-separated while rotating (see Security).
 - `ORCH_ALLOW_PRIVATE_UPSTREAMS`: comma-separated `host:port` (or `host`, any port; `[v6]:port` for IPv6) an upstream may use although private or internal, e.g. `my-mcp.railway.internal:8080`. Operator-owned Railway services only. Empty by default (see Security).
-- `ORCH_ALLOW_UNAUTHENTICATED`: `true` to accept requests without a key when `ORCH_INBOUND_KEY` is unset. Off by default: the service then refuses every request (see Security).
+- `ORCH_ALLOW_UNAUTHENTICATED`: `true` to accept requests without a key when `ORCH_INBOUND_KEY` is unset. Off by default: with a service key configured (or a key set with no valid entry), every request but `/health` is refused (see Security and Rollback order).
 - `MCP_UPSTREAMS`: JSON array of upstream MCP servers. Used only for a request with no `x-mcp-integration-id`.
 - `ORCH_AUTO_DISCOVER`: `true` by default. If true and Supabase is configured, the orchestrator will look up MCP URLs from your Supabase integrations table.
 - `ORCH_TIMEOUT_MS`: e.g. `50000`

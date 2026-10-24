@@ -4,27 +4,16 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { spawn } from 'node:child_process'
-import { createServer } from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { startOrchestrator } from '../fixtures/orchestrator.mjs'
 
 const KEY = 'test-inbound-key-0123456789abcdef'
-const SERVER = fileURLToPath(new URL('../server.js', import.meta.url))
 const FAKE_DNS = fileURLToPath(new URL('../fixtures/fake-dns.mjs', import.meta.url))
 const TOKEN_ROW = '33333333-3333-4333-8333-333333333333'
 const TOKEN_DNS_ROW = '44444444-4444-4444-8444-444444444444'
 const SCHEMELESS_ROW = '55555555-5555-4555-8555-555555555555'
+const SELF_ROW = '66666666-6666-4666-8666-666666666666'
 const SECRET = 'client-secret-never-logged'
-
-async function freePort() {
-  return new Promise((resolve) => {
-    const s = createServer()
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address()
-      s.close(() => resolve(port))
-    })
-  })
-}
 
 const listen = (handler) => new Promise((resolve) => {
   const server = http.createServer(handler)
@@ -37,21 +26,10 @@ let mcpHits = 0
 const servers = []
 
 async function start(env) {
-  const port = await freePort()
-  const child = spawn(process.execPath, ['--import', FAKE_DNS, SERVER], {
-    env: { PATH: process.env.PATH, PORT: String(port), ORCH_INBOUND_KEY: KEY, SUPABASE_URL: `http://127.0.0.1:${db.address().port}`, SUPABASE_SERVICE_ROLE_KEY: 'test-service-key', ...env },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let output = ''
-  child.stdout.on('data', (d) => { output += d })
-  child.stderr.on('data', (d) => { output += d })
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`server did not start: ${output}`)), 5000)
-    child.stdout.on('data', () => {
-      if (output.includes('Listening on port')) { clearTimeout(timer); setTimeout(resolve, 20) }
-    })
-  })
-  const s = { url: `http://127.0.0.1:${port}`, child, output: () => output }
+  const s = await startOrchestrator(
+    { ORCH_INBOUND_KEY: KEY, SUPABASE_URL: `http://127.0.0.1:${db.address().port}`, SUPABASE_SERVICE_ROLE_KEY: 'test-service-key', ...env },
+    { nodeArgs: ['--import', FAKE_DNS] },
+  )
   servers.push(s)
   return s
 }
@@ -63,13 +41,15 @@ const call = async (url, headers = {}) => (await fetch(url, {
 })).json()
 
 before(async () => {
-  // PostgREST for three agent_integrations rows: a client-credentials token url on the metadata
-  // address, one on a name that resolves to 127.0.0.1, and an API wrapper whose url has no scheme
-  // (the shape of production's one active wrapper).
+  // PostgREST for four agent_integrations rows: a client-credentials token url on the metadata
+  // address, one on a name that resolves to 127.0.0.1, an API wrapper whose url has no scheme
+  // (the shape of production's one active wrapper), and a self-loop: a row whose url is the
+  // orchestrator's own public name, with custom headers naming another tenant's row.
   const rows = {
     [TOKEN_ROW]: { integration_type: 'mcp', config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'http://169.254.169.254/latest/token', oauthClientId: 'client', oauthClientSecret: SECRET } },
     [TOKEN_DNS_ROW]: { integration_type: 'mcp', config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'https://token.example.invalid/oauth/token', oauthClientId: 'client', oauthClientSecret: SECRET } },
     [SCHEMELESS_ROW]: { integration_type: 'api', config: { wrapperEnabled: true, wrapper: { url: 'mcp-wrapper.example.invalid/api/mcp/wrapper', authType: 'none' } } },
+    [SELF_ROW]: { integration_type: 'mcp', config: { url: 'https://orch-self.example.com/', authType: 'none', headers: { 'x-mcp-integration-id': TOKEN_ROW, 'x-orchestrator-key': 'guess' } } },
   }
   db = await listen((req, res) => {
     const id = Object.keys(rows).find((key) => req.url.startsWith('/rest/v1/agent_integrations') && req.url.includes(`id=eq.${key}`))
@@ -158,4 +138,22 @@ test('a name the static checks pass but that resolves to 127.0.0.1 is refused at
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
   assert.match(s.output(), /upstream_refused rebind\.example\.invalid: resolves to a private address/)
   assert.equal(mcpHits, 0)
+})
+
+test('the orchestrator\'s own Railway names are refused as upstreams, even when listed as allowed', async () => {
+  const s = await start({
+    RAILWAY_PUBLIC_DOMAIN: 'Orch-Self.example.com',
+    RAILWAY_PRIVATE_DOMAIN: 'orch-self.railway.internal',
+    MCP_UPSTREAMS: JSON.stringify([{ name: 'self', url: 'http://orch-self.railway.internal:9/' }]),
+    ORCH_ALLOW_PRIVATE_UPSTREAMS: 'orch-self.railway.internal:9,orch-self.example.com',
+  })
+  assert.match(s.output(), /own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal/)
+  // The self-loop row: its url is the public domain, its custom headers name another row.
+  const byRow = await call(s.url, { 'x-mcp-integration-id': SELF_ROW })
+  assert.deepEqual(byRow.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused orch-self\.example\.com: the orchestrator itself/)
+  // The private name, through MCP_UPSTREAMS, although ORCH_ALLOW_PRIVATE_UPSTREAMS lists it.
+  const byStatic = await call(s.url)
+  assert.deepEqual(byStatic.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused orch-self\.railway\.internal: the orchestrator itself/)
 })
