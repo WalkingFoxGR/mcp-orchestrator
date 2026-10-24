@@ -1,6 +1,17 @@
 import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 import { Agent } from 'undici'
+import {
+  apifyCacheKey,
+  createInboundGuard,
+  createRateLimitedLog,
+  createResolver,
+  integrationIdOf,
+  logLabel,
+  oauthTokenCacheKey,
+  parseInboundKeys,
+  sessionKeyFor,
+} from './lib/resolve.js'
 
 const PORT = Number(process.env.PORT || 3000)
 const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 minutes — guard against NaN/empty/"0" by parsing first then defaulting
@@ -30,15 +41,23 @@ const SUPABASE_INTEGRATIONS_CACHE_TTL_MS = Number(process.env.SUPABASE_INTEGRATI
 const AUTO_DISCOVER_UPSTREAMS = process.env.ORCH_AUTO_DISCOVER !== 'false'
 const UPSTREAMS = parseJson(process.env.MCP_UPSTREAMS || process.env.UPSTREAMS || '[]') || []
 const APIFY_DATASET_CACHE_TTL_MS = Number(process.env.APIFY_DATASET_CACHE_TTL_MS || 600000)
+// Every request but GET/HEAD /health must carry x-orchestrator-key equal to one of these
+// (comma-separated while rotating). Unset with a service key configured: every request is
+// refused, unless ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+const inboundGuard = createInboundGuard({
+  keys: parseInboundKeys(process.env.ORCH_INBOUND_KEY),
+  serviceKeyConfigured: Boolean(SUPABASE_KEY),
+  allowUnauthenticated: process.env.ORCH_ALLOW_UNAUTHENTICATED === 'true',
+})
+const logRefusal = createRateLimitedLog()
 
 const supabase = SUPABASE_URL && SUPABASE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } })
   : null
 
+// Upstream sessions, keyed by sessionKeyFor (the integration id for a row-backed upstream).
 const sessionCache = new Map()
 const oauthTokenCache = new Map()
-const integrationCache = new Map()
-const upstreamMap = new Map()
 const apifyDatasetCache = new Map()
 const apifyRunCache = new Map()
 const TOOL_SCHEMAS = {
@@ -79,12 +98,6 @@ const TOOL_SCHEMAS = {
     timeout: 50000,
   },
 }
-for (const upstream of UPSTREAMS) {
-  if (upstream && upstream.name) {
-    upstreamMap.set(normalizeKey(upstream.name), upstream)
-  }
-}
-
 function parseJson(value) {
   if (!value) return null
   try {
@@ -92,10 +105,6 @@ function parseJson(value) {
   } catch {
     return null
   }
-}
-
-function normalizeKey(value) {
-  return String(value || '').trim().toLowerCase()
 }
 
 function normalizeToolKey(value) {
@@ -119,11 +128,6 @@ function parseJsonValue(value) {
   return value
 }
 
-
-function getApifyCacheKey(integrationId, integrationName) {
-  const raw = integrationId || integrationName || ''
-  return String(raw).trim() || 'default'
-}
 
 function isApifyToolContext(toolName, integrationLabel) {
   const label = `${integrationLabel || ''} ${toolName || ''}`.toLowerCase()
@@ -341,7 +345,7 @@ async function getOAuthToken(cacheKey, config) {
   return data.access_token
 }
 
-async function buildAuthHeaders(config) {
+async function buildAuthHeaders(config, integrationId = '') {
   const headers = {}
   const authType = config.authType || 'none'
 
@@ -357,8 +361,7 @@ async function buildAuthHeaders(config) {
     const tokenType = config.oauthTokenType || 'Bearer'
     headers.Authorization = `${tokenType} ${config.oauthAccessToken}`
   } else if (authType === 'oauth_client_credentials') {
-    const cacheKey = `${config.oauthTokenUrl || ''}_${config.oauthClientId || ''}`
-    const token = await getOAuthToken(cacheKey, config)
+    const token = await getOAuthToken(oauthTokenCacheKey(integrationId, config), config)
     if (token) headers.Authorization = `Bearer ${token}`
   }
 
@@ -370,127 +373,48 @@ async function buildAuthHeaders(config) {
   return headers
 }
 
-function extractMcpConfigFromIntegration(integration) {
-  const config = integration?.config || {}
-  if (integration?.integration_type === 'mcp') {
-    return config
-  }
-  if (integration?.integration_type === 'api') {
-    const wrapperEnabled = config.wrapperEnabled === true
-    const wrapper = config.wrapper
-    if (wrapperEnabled && wrapper && typeof wrapper === 'object') {
-      return wrapper
-    }
-  }
-  return null
-}
-
-function getCachedIntegration(key) {
-  if (!key) return null
-  const cached = integrationCache.get(key)
-  if (cached && cached.expiresAt > Date.now()) return cached.upstream
-  integrationCache.delete(key)
-  return null
-}
-
-async function fetchIntegrationConfig(integrationId, integrationName) {
-  if (!supabase) return null
-  if (!integrationId && !integrationName) return null
-
-  if (integrationId) {
-    const { data, error } = await supabase
-      .from(SUPABASE_INTEGRATIONS_TABLE)
-      .select('id,name,config,integration_type,is_active,is_verified,updated_at')
-      .eq('id', integrationId)
-      .maybeSingle()
-    if (error) {
-      console.error('[MCP Orchestrator] Integration lookup failed:', error.message)
-      return null
-    }
-    return data || null
-  }
-
+async function fetchIntegrationById(integrationId) {
   const { data, error } = await supabase
     .from(SUPABASE_INTEGRATIONS_TABLE)
     .select('id,name,config,integration_type,is_active,is_verified,updated_at')
-    .eq('name', integrationName)
-    .order('updated_at', { ascending: false })
-    .limit(1)
+    .eq('id', integrationId)
     .maybeSingle()
-  if (error) {
-    console.error('[MCP Orchestrator] Integration lookup failed:', error.message)
-    return null
-  }
+  // A read error throws, so the resolver can tell it from a missing row.
+  if (error) throw new Error(error.message || 'Integration lookup failed')
   return data || null
 }
 
-function cacheIntegration(key, upstream) {
-  if (!key || !upstream) return
-  integrationCache.set(key, {
-    upstream,
-    expiresAt: Date.now() + SUPABASE_INTEGRATIONS_CACHE_TTL_MS,
-  })
+// Resolves by x-mcp-integration-id only, cached by id for SUPABASE_INTEGRATIONS_CACHE_TTL_MS (lib/resolve.js).
+const resolver = createResolver({
+  fetchIntegrationById: supabase ? fetchIntegrationById : null,
+  buildAuthHeaders,
+  normalizeUrl,
+  ttlMs: SUPABASE_INTEGRATIONS_CACHE_TTL_MS,
+  defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
+  staticUpstreams: UPSTREAMS,
+  autoDiscover: AUTO_DISCOVER_UPSTREAMS,
+})
+
+const UNRESOLVED = {
+  bad_id: ['x-mcp-integration-id is not a valid integration id', -32602],
+  not_found: ['No MCP integration with that x-mcp-integration-id', -32601],
+  lookup_failed: ['The MCP integration could not be read just now; try again', -32603],
 }
 
-async function resolveUpstream(req, toolName) {
-  const nameHeader = extractIntegrationHeader(req, 'x-mcp-integration-name')
-  const idHeader = extractIntegrationHeader(req, 'x-mcp-integration-id')
-  const cacheKey = normalizeKey(idHeader || nameHeader)
-  let upstream = null
+/** The JSON-RPC error for a request whose upstream did not resolve. */
+function unresolvedError(id, reason, fallbackMessage) {
+  const [message, code] = UNRESOLVED[reason] || [fallbackMessage, -32601]
+  return buildJsonRpcError(id, message, code)
+}
 
-  // Prefer integration ID resolution first to avoid collisions when multiple
-  // integrations share the same human-readable name.
-  if (idHeader) {
-    upstream = getCachedIntegration(normalizeKey(idHeader))
-    if (!upstream) {
-      upstream = upstreamMap.get(normalizeKey(idHeader))
-    }
-  }
-  if (!upstream && nameHeader) {
-    upstream = getCachedIntegration(normalizeKey(nameHeader))
-    if (!upstream) {
-      upstream = upstreamMap.get(normalizeKey(nameHeader))
-    }
-  }
-  if (!upstream && cacheKey) {
-    upstream = getCachedIntegration(cacheKey)
-  }
-  if (!upstream && AUTO_DISCOVER_UPSTREAMS && supabase && (idHeader || nameHeader)) {
-    const integration = await fetchIntegrationConfig(idHeader, nameHeader)
-    if (integration && integration.is_active !== false) {
-      const mcpConfig = extractMcpConfigFromIntegration(integration)
-      if (mcpConfig && mcpConfig.url) {
-        const headers = await buildAuthHeaders(mcpConfig)
-        upstream = {
-          name: integration.name || nameHeader || idHeader,
-          url: normalizeUrl(mcpConfig.url),
-          headers,
-          timeoutMs: Number(mcpConfig.timeoutMs || mcpConfig.timeout_ms) || DEFAULT_TIMEOUT_MS,
-          cacheKey: integration.id || idHeader || integration.name,
-        }
-        cacheIntegration(cacheKey, upstream)
-        upstreamMap.set(normalizeKey(integration.id), upstream)
-        upstreamMap.set(normalizeKey(integration.name), upstream)
-      }
-    }
-  }
-  if (!upstream && toolName) {
-    for (const candidate of UPSTREAMS) {
-      const includes = Array.isArray(candidate?.toolNameIncludes) ? candidate.toolNameIncludes : []
-      if (includes.some((entry) => toolName.toLowerCase().includes(String(entry).toLowerCase()))) {
-        upstream = candidate
-        break
-      }
-    }
-  }
-  if (!upstream && UPSTREAMS.length === 1) {
-    upstream = UPSTREAMS[0]
-  }
-  return upstream || null
+/** The integration a request names, for log lines: its id, else its name header sanitised. */
+function integrationLabelOf(req) {
+  const id = integrationIdOf(req.headers)
+  return id || logLabel(extractIntegrationHeader(req, 'x-mcp-integration-name')) || 'unknown'
 }
 
 async function ensureUpstreamSession(upstream) {
-  const cacheKey = normalizeKey(upstream.cacheKey || upstream.name || upstream.url)
+  const cacheKey = sessionKeyFor(upstream)
   const cached = sessionCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) return cached.sessionId
 
@@ -932,16 +856,17 @@ async function handleToolCall(req, body) {
   const id = body.id ?? null
   const params = body.params || {}
   const toolName = params.name || ''
-  const integrationName = extractIntegrationHeader(req, 'x-mcp-integration-name')
-  const integrationId = extractIntegrationHeader(req, 'x-mcp-integration-id')
-  const integrationLabel = integrationName || integrationId || 'unknown'
-  const apifyCacheKey = getApifyCacheKey(integrationId, integrationName)
-  console.log(`[MCP Orchestrator] tools/call ${toolName} integration=${integrationLabel}`)
+  const integrationId = integrationIdOf(req.headers) || ''
+  const integrationLabel = integrationLabelOf(req)
+  // The name header only tells whether this looks like Apify (its run and dataset ids are cached by integration id).
+  const integrationHint = `${logLabel(extractIntegrationHeader(req, 'x-mcp-integration-name'))} ${integrationLabel}`
+  const apifyKey = apifyCacheKey(integrationId)
+  console.log(`[MCP Orchestrator] tools/call ${logLabel(toolName)} integration=${integrationLabel}`)
   let args = parseToolArguments(params.arguments || params.args || {})
   args = normalizeCreateWorkflowArgs(toolName, args)
   if (isApifyGetActorOutputTool(toolName)) {
-    const cachedDatasetId = getCachedApifyDatasetId(apifyCacheKey)
-    const cachedRunId = getCachedApifyRunId(apifyCacheKey)
+    const cachedDatasetId = getCachedApifyDatasetId(apifyKey)
+    const cachedRunId = getCachedApifyRunId(apifyKey)
     const datasetArg = args?.datasetId
     const needsInjection = isPlaceholderDatasetId(datasetArg)
       || (cachedRunId && cachedDatasetId && String(datasetArg).trim() === String(cachedRunId).trim())
@@ -954,7 +879,7 @@ async function handleToolCall(req, body) {
   }
 
   if (isApifyGetActorRunTool(toolName) && (!args?.runId || String(args.runId).trim() === '')) {
-    const cachedRunId = getCachedApifyRunId(apifyCacheKey)
+    const cachedRunId = getCachedApifyRunId(apifyKey)
     if (cachedRunId) {
       args = { ...args, runId: cachedRunId }
       console.log(`[MCP Orchestrator] Injected cached Apify run ID for ${toolName}`)
@@ -975,9 +900,9 @@ async function handleToolCall(req, body) {
     safeArgs._orchestrator_note = `Arguments truncated to stay under ${MAX_ARG_BYTES} bytes.`
   }
 
-  const upstream = await resolveUpstream(req, toolName)
+  const { upstream, reason } = await resolver.resolve(req.headers, toolName)
   if (!upstream) {
-    return buildJsonRpcError(id, `No upstream configured for tool ${toolName}`, -32601)
+    return unresolvedError(id, reason, `No upstream configured for tool ${toolName}`)
   }
 
   let sessionId = await ensureUpstreamSession(upstream)
@@ -1000,8 +925,7 @@ async function handleToolCall(req, body) {
     const isSessionError = errMsg.includes('tool not found') || errMsg.includes('session') || errMsg.includes('invalid') || errCode === -32000 || errCode === -32601 || errCode === -32603
     if (isSessionError) {
       console.log(`[MCP Orchestrator] Session error for ${toolName}, retrying with fresh session...`)
-      const cacheKey = normalizeKey(upstream.cacheKey || upstream.name || upstream.url)
-      sessionCache.delete(cacheKey)
+      sessionCache.delete(sessionKeyFor(upstream))
       sessionId = await ensureUpstreamSession(upstream)
       rpc.id = Date.now()
       response = await sendRpc(upstream, rpc, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
@@ -1018,14 +942,14 @@ async function handleToolCall(req, body) {
 
   let result = response.data.result
   if (result) {
-    if (isApifyToolContext(toolName, integrationLabel)) {
+    if (isApifyToolContext(toolName, integrationHint)) {
       const payload = extractResultPayload(result)
       let datasetId = extractApifyDatasetId(payload.value)
       if (!datasetId) {
         datasetId = extractApifyDatasetId(result)
       }
       if (datasetId) {
-        setCachedApifyDatasetId(apifyCacheKey, datasetId)
+        setCachedApifyDatasetId(apifyKey, datasetId)
         console.log(`[MCP Orchestrator] Cached Apify dataset ID ${datasetId}`)
       }
       let runId = extractApifyRunId(payload.value)
@@ -1033,7 +957,7 @@ async function handleToolCall(req, body) {
         runId = extractApifyRunId(result)
       }
       if (runId) {
-        setCachedApifyRunId(apifyCacheKey, runId)
+        setCachedApifyRunId(apifyKey, runId)
         console.log(`[MCP Orchestrator] Cached Apify run ID ${runId}`)
       }
     }
@@ -1046,14 +970,12 @@ async function handleToolCall(req, body) {
 async function handleToolsList(req, body) {
   const id = body.id ?? null
   const params = body.params || {}
-  const integrationName = extractIntegrationHeader(req, 'x-mcp-integration-name')
-  const integrationId = extractIntegrationHeader(req, 'x-mcp-integration-id')
-  const integrationLabel = integrationName || integrationId || 'unknown'
+  const integrationLabel = integrationLabelOf(req)
   console.log(`[MCP Orchestrator] tools/list integration=${integrationLabel}`)
 
-  const upstream = await resolveUpstream(req, '')
+  const { upstream, reason } = await resolver.resolve(req.headers, '')
   if (!upstream) {
-    return buildJsonRpcError(id, `No upstream configured for integration ${integrationLabel}`, -32601)
+    return unresolvedError(id, reason, `No upstream configured for integration ${integrationLabel}`)
   }
 
   let sessionId = await ensureUpstreamSession(upstream)
@@ -1071,8 +993,7 @@ async function handleToolsList(req, body) {
     const errCode = response.data.error.code
     const isSessionError = errMsg.includes('session') || errCode === -32603
     if (isSessionError) {
-      const cacheKey = normalizeKey(upstream.cacheKey || upstream.name || upstream.url)
-      sessionCache.delete(cacheKey)
+      sessionCache.delete(sessionKeyFor(upstream))
       sessionId = await ensureUpstreamSession(upstream)
       rpc.id = Date.now()
       response = await sendRpc(upstream, rpc, upstream.timeoutMs || DEFAULT_TIMEOUT_MS, sessionId)
@@ -1112,6 +1033,15 @@ const server = http.createServer(async (req, res) => {
   if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: true }))
+    return
+  }
+
+  const inbound = inboundGuard.check(req.headers)
+  if (!inbound.ok) {
+    const from = req.socket?.remoteAddress || 'unknown'
+    logRefusal(from, `[MCP Orchestrator] 401 ${req.method} ${logLabel(req.url)} from ${logLabel(from)}: inbound key ${inbound.reason}`)
+    res.writeHead(401, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Unauthorized' }))
     return
   }
 
@@ -1256,4 +1186,6 @@ async function dispatchRequest(req, body) {
 server.listen(PORT, () => {
   console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
+  if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
+  else console.warn(inboundGuard.startupLine)
 })
