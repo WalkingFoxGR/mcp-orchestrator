@@ -40,7 +40,7 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 mi
 // The orchestrator's own Railway names are never an upstream, listed or not: a row pointing back at
 // it would call it with that row's custom headers (a self-loop).
 const ALLOWED_PRIVATE_UPSTREAMS = parseAllowedHosts(process.env.ORCH_ALLOW_PRIVATE_UPSTREAMS)
-const OWN_HOSTS = parseOwnHosts(process.env.RAILWAY_PUBLIC_DOMAIN, process.env.RAILWAY_PRIVATE_DOMAIN)
+const OWN_HOSTS = parseOwnHosts(process.env.RAILWAY_PUBLIC_DOMAIN, process.env.RAILWAY_PRIVATE_DOMAIN, process.env.RAILWAY_STATIC_URL)
 const guardedLookup = createGuardedLookup({ allowed: ALLOWED_PRIVATE_UPSTREAMS, own: OWN_HOSTS })
 const upstreamDispatcher = new Agent({
   headersTimeout: 0,

@@ -6,7 +6,7 @@ import dns from 'node:dns'
 const real = dns.lookup
 // orch-self.*: the orchestrator's own names in the self-loop test, so a guard that let them
 // through would dial 127.0.0.1 here, never a real address.
-const LOCAL = new Set(['rebind.example.invalid', 'token.example.invalid', 'mcp-wrapper.example.invalid', 'orch-self.example.com', 'orch-self.railway.internal'])
+const LOCAL = new Set(['rebind.example.invalid', 'token.example.invalid', 'mcp-wrapper.example.invalid', 'orch-self.example.com', 'orch-self.railway.internal', 'orch-static.example.com'])
 dns.lookup = (host, options, callback) => {
   if (typeof options === 'function') {
     callback = options

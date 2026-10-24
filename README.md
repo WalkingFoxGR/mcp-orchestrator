@@ -38,7 +38,7 @@ never be reachable by anyone but Nexus.
   IPv4 (any textual form); cloud metadata (169.254.169.254, fd00:ec2::254); and the hostnames
   `localhost`, `*.localhost`, `*.local`, `*.internal` (Railway's private network) and any
   single-label name. The orchestrator's own names (`RAILWAY_PUBLIC_DOMAIN`,
-  `RAILWAY_PRIVATE_DOMAIN`, set by Railway) are refused too, even when allow-listed: a row pointing
+  `RAILWAY_PRIVATE_DOMAIN`, and the legacy `RAILWAY_STATIC_URL` when set) are refused too, whatever they resolve to, even when allow-listed: a row pointing
   back at the orchestrator would call it with that row's custom headers. A custom domain on this
   service is not covered; it should have none. A name is checked on the addresses the connection actually dials (a guarded
   lookup on the undici Agent), so DNS rebinding between a check and the connect does not get

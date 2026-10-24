@@ -13,6 +13,7 @@ const TOKEN_ROW = '33333333-3333-4333-8333-333333333333'
 const TOKEN_DNS_ROW = '44444444-4444-4444-8444-444444444444'
 const SCHEMELESS_ROW = '55555555-5555-4555-8555-555555555555'
 const SELF_ROW = '66666666-6666-4666-8666-666666666666'
+const STATIC_URL_ROW = '77777777-7777-4777-8777-777777777777'
 const SECRET = 'client-secret-never-logged'
 
 const listen = (handler) => new Promise((resolve) => {
@@ -50,6 +51,7 @@ before(async () => {
     [TOKEN_DNS_ROW]: { integration_type: 'mcp', config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'https://token.example.invalid/oauth/token', oauthClientId: 'client', oauthClientSecret: SECRET } },
     [SCHEMELESS_ROW]: { integration_type: 'api', config: { wrapperEnabled: true, wrapper: { url: 'mcp-wrapper.example.invalid/api/mcp/wrapper', authType: 'none' } } },
     [SELF_ROW]: { integration_type: 'mcp', config: { url: 'https://orch-self.example.com/', authType: 'none', headers: { 'x-mcp-integration-id': TOKEN_ROW, 'x-orchestrator-key': 'guess' } } },
+    [STATIC_URL_ROW]: { integration_type: 'mcp', config: { url: 'https://orch-static.example.com/mcp', authType: 'none' } },
   }
   db = await listen((req, res) => {
     const id = Object.keys(rows).find((key) => req.url.startsWith('/rest/v1/agent_integrations') && req.url.includes(`id=eq.${key}`))
@@ -144,10 +146,11 @@ test('the orchestrator\'s own Railway names are refused as upstreams, even when 
   const s = await start({
     RAILWAY_PUBLIC_DOMAIN: 'Orch-Self.example.com',
     RAILWAY_PRIVATE_DOMAIN: 'orch-self.railway.internal',
+    RAILWAY_STATIC_URL: 'https://orch-static.example.com',
     MCP_UPSTREAMS: JSON.stringify([{ name: 'self', url: 'http://orch-self.railway.internal:9/' }]),
     ORCH_ALLOW_PRIVATE_UPSTREAMS: 'orch-self.railway.internal:9,orch-self.example.com',
   })
-  assert.match(s.output(), /own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal/)
+  assert.match(s.output(), /own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal, orch-static\.example\.com/)
   // The self-loop row: its url is the public domain, its custom headers name another row.
   const byRow = await call(s.url, { 'x-mcp-integration-id': SELF_ROW })
   assert.deepEqual(byRow.error, { code: -32010, message: 'upstream_refused' })
@@ -156,4 +159,8 @@ test('the orchestrator\'s own Railway names are refused as upstreams, even when 
   const byStatic = await call(s.url)
   assert.deepEqual(byStatic.error, { code: -32010, message: 'upstream_refused' })
   assert.match(s.output(), /upstream_refused orch-self\.railway\.internal: the orchestrator itself/)
+  // The legacy RAILWAY_STATIC_URL, given as a url, counts by its hostname.
+  const byStaticUrl = await call(s.url, { 'x-mcp-integration-id': STATIC_URL_ROW })
+  assert.deepEqual(byStaticUrl.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused orch-static\.example\.com: the orchestrator itself/)
 })
