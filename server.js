@@ -1167,7 +1167,7 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-/** A refused upstream answers JSON-RPC `upstream_refused` and one log line with the host, never a credential. */
+/** A refused upstream answers JSON-RPC -32010 `upstream_refused` and one log line with the host and reason, never a credential. */
 async function dispatchRequest(req, body) {
   try {
     return await dispatchMethod(req, body)
@@ -1175,7 +1175,10 @@ async function dispatchRequest(req, body) {
     const refused = refusalIn(err)
     if (!refused) throw err
     console.warn(`[MCP Orchestrator] upstream_refused ${logLabel(refused.host)}: ${logLabel(refused.reason)} (integration=${integrationLabelOf(req)})`)
-    return { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32001, message: 'upstream_refused', data: { host: refused.host, reason: refused.reason } } }
+    // -32010: a plain server error. Not -32001 (the MCP SDK's RequestTimeout, which Nexus reads as
+    // "still running, retry") nor -32000/-32002/-32042. One generic message: the host and the reason
+    // stay in the log line, so the answer tells nobody which internal names exist.
+    return { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32010, message: 'upstream_refused' } }
   }
 }
 
@@ -1217,7 +1220,7 @@ async function dispatchMethod(req, body) {
 server.listen(PORT, () => {
   console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
-  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS).map(logLabel).join(', ') : 'none'}`)
+  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS, ([host, ports]) => logLabel(ports ? `${host}:${[...ports].join('|')}` : `${host} (any port)`)).join(', ') : 'none'}`)
   if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
   else console.warn(inboundGuard.startupLine)
 })

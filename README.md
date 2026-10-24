@@ -28,22 +28,30 @@ never be reachable by anyone but Nexus.
 
 - **Upstreams must be public.** Every upstream fetch (initialize, tools/list, tools/call, the
   client-credentials token fetch) refuses loopback, private, link-local, CGNAT (100.64/10),
-  multicast, unique-local and IPv4-mapped/NAT64 IPv6 addresses, cloud metadata (169.254.169.254,
-  fd00:ec2::254), and the hostnames `localhost`, `*.localhost`, `*.local`, `*.internal` (Railway's
-  private network) and any single-label name. A name is checked on the addresses the connection
-  actually dials (a guarded lookup on the undici Agent), so DNS rebinding between a check and the
-  connect does not get through. Redirects are followed by hand, at most 5, each hop checked again;
+  192.0.0.0/24, documentation and multicast addresses; unique-local, link-local, site-local, Teredo,
+  local-use NAT64 and documentation IPv6, and IPv4-mapped, NAT64 or 6to4 IPv6 that embeds a refused
+  IPv4 (any textual form); cloud metadata (169.254.169.254, fd00:ec2::254); and the hostnames
+  `localhost`, `*.localhost`, `*.local`, `*.internal` (Railway's private network) and any
+  single-label name. A name is checked on the addresses the connection actually dials (a guarded
+  lookup on the undici Agent), so DNS rebinding between a check and the connect does not get
+  through. Only 301, 302, 303, 307 and 308 are followed, by hand, at most 5, each hop checked again;
   a hop to another origin keeps only `Accept` and `Content-Type`, and a request body never follows
-  one. A refused upstream answers JSON-RPC `-32001 upstream_refused` with the host, and logs one line
-  with the host and no credentials. `ORCH_ALLOW_PRIVATE_UPSTREAMS` lists exact hosts that may be
-  private, for a legitimate internal upstream.
+  one (a same-host http to https upgrade on the default ports counts as the same origin). A refused
+  upstream answers JSON-RPC `-32010 upstream_refused` (not -32001, the MCP SDK's timeout code) and
+  logs one line with the host and the reason, never a credential.
+- **`ORCH_ALLOW_PRIVATE_UPSTREAMS` is a hole by design.** A listed host skips the address check, for
+  every tenant: any integration may then point at it. List only operator-owned Railway services
+  (`name.railway.internal`), never a DNS name a tenant controls (they could repoint it at the
+  metadata address), and scope each entry to its port (`name.railway.internal:8080`); an entry
+  without a port opens every port of that host.
 
 Deploy order when turning the key on: set `ORCH_INBOUND_KEY` here and `MCP_ORCHESTRATOR_KEY` in Nexus,
 deploy Nexus (it then sends the key), then deploy this service.
 
 The upstream guard (branch `fix/upstream-ssrf-guard`) is built on the inbound key change
-(`fix/inbound-auth-id-only`) and merges after it. Before deploying it, set
-`ORCH_ALLOW_PRIVATE_UPSTREAMS` for any integration whose URL is private or internal today.
+(`fix/inbound-auth-id-only`) and merges after it. Before deploying it, check that no integration
+and no `MCP_UPSTREAMS` entry points at a private or internal host; an integration that does stops
+working (see the warning above before listing anything).
 
 Rollback order: roll this service back, or set `ORCH_ALLOW_UNAUTHENTICATED=true` and unset
 `ORCH_INBOUND_KEY`, **before** Nexus stops sending the key (a Nexus rollback or an unset
@@ -62,7 +70,7 @@ Rollback order: roll this service back, or set `ORCH_ALLOW_UNAUTHENTICATED=true`
 3) Set environment variables:
    - `PORT`: `3000`
 - `ORCH_INBOUND_KEY`: the key every request but `/health` must carry in `x-orchestrator-key`; comma-separated while rotating (see Security).
-- `ORCH_ALLOW_PRIVATE_UPSTREAMS`: comma-separated exact hosts (or IPs) an upstream may use although they are private or internal, e.g. `my-mcp.railway.internal`. Empty by default (see Security).
+- `ORCH_ALLOW_PRIVATE_UPSTREAMS`: comma-separated `host:port` (or `host`, any port; `[v6]:port` for IPv6) an upstream may use although private or internal, e.g. `my-mcp.railway.internal:8080`. Operator-owned Railway services only. Empty by default (see Security).
 - `ORCH_ALLOW_UNAUTHENTICATED`: `true` to accept requests without a key when `ORCH_INBOUND_KEY` is unset. Off by default: the service then refuses every request (see Security).
 - `MCP_UPSTREAMS`: JSON array of upstream MCP servers. Used only for a request with no `x-mcp-integration-id`.
 - `ORCH_AUTO_DISCOVER`: `true` by default. If true and Supabase is configured, the orchestrator will look up MCP URLs from your Supabase integrations table.

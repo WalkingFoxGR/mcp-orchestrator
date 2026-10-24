@@ -12,6 +12,8 @@ const KEY = 'test-inbound-key-0123456789abcdef'
 const SERVER = fileURLToPath(new URL('../server.js', import.meta.url))
 const FAKE_DNS = fileURLToPath(new URL('../fixtures/fake-dns.mjs', import.meta.url))
 const TOKEN_ROW = '33333333-3333-4333-8333-333333333333'
+const TOKEN_DNS_ROW = '44444444-4444-4444-8444-444444444444'
+const SCHEMELESS_ROW = '55555555-5555-4555-8555-555555555555'
 const SECRET = 'client-secret-never-logged'
 
 async function freePort() {
@@ -61,14 +63,19 @@ const call = async (url, headers = {}) => (await fetch(url, {
 })).json()
 
 before(async () => {
-  // PostgREST for one agent_integrations row whose client-credentials token url is the metadata address.
+  // PostgREST for three agent_integrations rows: a client-credentials token url on the metadata
+  // address, one on a name that resolves to 127.0.0.1, and an API wrapper whose url has no scheme
+  // (the shape of production's one active wrapper).
+  const rows = {
+    [TOKEN_ROW]: { integration_type: 'mcp', config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'http://169.254.169.254/latest/token', oauthClientId: 'client', oauthClientSecret: SECRET } },
+    [TOKEN_DNS_ROW]: { integration_type: 'mcp', config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'https://token.example.invalid/oauth/token', oauthClientId: 'client', oauthClientSecret: SECRET } },
+    [SCHEMELESS_ROW]: { integration_type: 'api', config: { wrapperEnabled: true, wrapper: { url: 'mcp-wrapper.example.invalid/api/mcp/wrapper', authType: 'none' } } },
+  }
   db = await listen((req, res) => {
-    if (req.url.startsWith('/rest/v1/agent_integrations') && req.url.includes(`id=eq.${TOKEN_ROW}`)) {
+    const id = Object.keys(rows).find((key) => req.url.startsWith('/rest/v1/agent_integrations') && req.url.includes(`id=eq.${key}`))
+    if (id) {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({
-        id: TOKEN_ROW, name: 'Token row', integration_type: 'mcp', is_active: true,
-        config: { url: 'https://mcp.example.com/mcp', authType: 'oauth_client_credentials', oauthTokenUrl: 'http://169.254.169.254/latest/token', oauthClientId: 'client', oauthClientSecret: SECRET },
-      }))
+      res.end(JSON.stringify({ id, name: 'Row', is_active: true, ...rows[id] }))
       return
     }
     res.writeHead(406, { 'content-type': 'application/json' })
@@ -98,9 +105,8 @@ test('a static upstream on 127.0.0.1 answers upstream_refused, logs one line wit
   mcpHits = 0
   const reply = await call(s.url)
   assert.equal(reply.id, 7)
-  assert.equal(reply.error.code, -32001)
-  assert.equal(reply.error.message, 'upstream_refused')
-  assert.deepEqual(reply.error.data, { host: '127.0.0.1', reason: 'private address' })
+  // -32010, not the SDK's -32001 RequestTimeout; one generic message, no host or reason.
+  assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
   assert.equal(mcpHits, 0)
   const lines = s.output().split('\n').filter((l) => l.includes('upstream_refused'))
   assert.equal(lines.length, 1)
@@ -111,10 +117,26 @@ test('a static upstream on 127.0.0.1 answers upstream_refused, logs one line wit
 test('the client-credentials token fetch is guarded too, and the secret is never logged or answered', async () => {
   const s = await start({})
   const reply = await call(s.url, { 'x-mcp-integration-id': TOKEN_ROW })
-  assert.equal(reply.error.message, 'upstream_refused')
-  assert.deepEqual(reply.error.data, { host: '169.254.169.254', reason: 'private address' })
+  assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused 169\.254\.169\.254: private address/)
   assert.ok(!s.output().includes(SECRET))
   assert.ok(!JSON.stringify(reply).includes(SECRET))
+})
+
+test('a token url whose name resolves to 127.0.0.1 is refused by the token fetch\'s own pinned lookup', async () => {
+  const s = await start({})
+  const reply = await call(s.url, { 'x-mcp-integration-id': TOKEN_DNS_ROW })
+  assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused token\.example\.invalid: resolves to a private address/)
+  assert.ok(!s.output().includes(SECRET))
+})
+
+test('a wrapper url with no scheme is checked as the https url it is fetched as', async () => {
+  const s = await start({})
+  const reply = await call(s.url, { 'x-mcp-integration-id': SCHEMELESS_ROW })
+  assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused mcp-wrapper\.example\.invalid: resolves to a private address/)
+  assert.ok(!/Invalid URL/i.test(s.output()))
 })
 
 test('ORCH_ALLOW_PRIVATE_UPSTREAMS lets an exact host through', async () => {
@@ -126,14 +148,14 @@ test('ORCH_ALLOW_PRIVATE_UPSTREAMS lets an exact host through', async () => {
   const reply = await call(s.url)
   assert.equal(reply.error, undefined)
   assert.ok(mcpHits > 0)
-  assert.match(s.output(), /private hosts allowed: 127\.0\.0\.1/)
+  assert.match(s.output(), /private hosts allowed: 127\.0\.0\.1 \(any port\)/)
 })
 
 test('a name the static checks pass but that resolves to 127.0.0.1 is refused at connect time (the pinned lookup)', async () => {
   const s = await start({ MCP_UPSTREAMS: JSON.stringify([{ name: 'rebind', url: `http://rebind.example.invalid:${mcp.address().port}/mcp` }]) })
   mcpHits = 0
   const reply = await call(s.url)
-  assert.equal(reply.error.message, 'upstream_refused')
-  assert.deepEqual(reply.error.data, { host: 'rebind.example.invalid', reason: 'resolves to a private address' })
+  assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
+  assert.match(s.output(), /upstream_refused rebind\.example\.invalid: resolves to a private address/)
   assert.equal(mcpHits, 0)
 })

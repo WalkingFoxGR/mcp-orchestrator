@@ -9,6 +9,7 @@ import {
   createGuardedLookup,
   guardedFetch,
   hostRefusal,
+  isAllowed,
   isPrivateIp,
   parseAllowedHosts,
   refusalIn,
@@ -32,27 +33,40 @@ function fakeDns(answers) {
   return { lookup, calls }
 }
 
-test('every refused address class', () => {
+test('every refused address class, in any textual form', () => {
   const refused = [
     '127.0.0.1', '127.8.9.10', '0.0.0.0', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1',
-    '169.254.169.254', '169.254.1.1', '100.64.0.1', '100.127.255.254', '224.0.0.1', '255.255.255.255',
-    '::1', '::', '[::1]', 'fe80::1', 'febf::1', 'fc00::1', 'fd12:3456::1', 'fd00:ec2::254', 'ff02::1',
-    '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', '::ffff:10.0.0.1', '64:ff9b::a9fe:a9fe', 'not-an-ip',
+    '169.254.169.254', '169.254.1.1', '100.64.0.1', '100.127.255.254', '192.0.0.1', '192.0.0.170', '192.0.2.10',
+    '224.0.0.1', '255.255.255.255',
+    '::1', '::', '[::1]', '0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001', '::7f00:1',
+    'fe80::1', 'febf::1', 'fec0::1', 'fc00::1', 'fd12:3456::1', 'fd00:ec2::254', 'FD00:EC2:0:0:0:0:0:254', 'ff02::1',
+    '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', '::ffff:a9fe:a9fe', '::ffff:10.0.0.1',
+    '64:ff9b::a9fe:a9fe', '64:ff9b::127.0.0.1', '64:ff9b:1::a9fe:a9fe', '64:ff9b:1:abcd::1',
+    '2002:a9fe:a9fe::1', '2002:7f00:1::', '2002:c0a8:101::1', '2001:0:4136:e378:8000:63bf:3fff:fdd2', '2001::1', '2001:db8::1',
+    'fe80::1%eth0', 'not-an-ip',
   ]
   for (const ip of refused) assert.equal(isPrivateIp(ip), true, ip)
-  for (const ip of ['93.184.216.34', '8.8.8.8', '100.63.255.255', '100.128.0.1', '172.32.0.1', '2606:4700::6810:84e5', '::ffff:93.184.216.34']) {
-    assert.equal(isPrivateIp(ip), false, ip)
-  }
+  const allowed = [
+    '93.184.216.34', '8.8.8.8', '100.63.255.255', '100.128.0.1', '172.32.0.1',
+    // WordPress.com, Jetpack, WooCommerce, IANA: public hosting inside 192.0.0.0/16.
+    '192.0.78.9', '192.0.66.5', '192.0.43.8', '192.0.1.1', '192.0.3.1',
+    '2606:4700::6810:84e5', '::ffff:93.184.216.34', '64:ff9b::c000:4e09', '64:ff9b::192.0.78.9', '2002:5db8:d822::1', '2001:4860:4860::8888',
+  ]
+  for (const ip of allowed) assert.equal(isPrivateIp(ip), false, ip)
 })
 
-test('internal names, single labels and private literals are refused before any lookup', () => {
+test('internal names, single labels and private literals are refused before any lookup, with any trailing dots', () => {
   const cases = {
     localhost: 'internal hostname',
+    'localhost.': 'internal hostname',
+    'localhost..': 'internal hostname',
     'api.localhost': 'internal hostname',
     'printer.local': 'internal hostname',
     'mcp-orchestrator.railway.internal': 'internal hostname',
+    'foo.internal..': 'internal hostname',
     'metadata.google.internal': 'internal hostname',
     postgres: 'single-label hostname',
+    'postgres...': 'single-label hostname',
     '127.0.0.1': 'private address',
     '[fd00:ec2::254]': 'private address',
     '169.254.169.254': 'private address',
@@ -64,9 +78,10 @@ test('internal names, single labels and private literals are refused before any 
 })
 
 test('a public host resolves and is handed to the connection as resolved', async () => {
-  const { lookup } = fakeDns({ 'mcp.example.com': ['93.184.216.34'] })
+  const { lookup } = fakeDns({ 'mcp.example.com': ['93.184.216.34'], 'public-api.wordpress.com': ['192.0.78.9'] })
   const guarded = createGuardedLookup({ lookup })
   assert.deepEqual(await lookupResult(guarded, 'mcp.example.com'), { err: null, address: '93.184.216.34', family: 4 })
+  assert.deepEqual(await lookupResult(guarded, 'public-api.wordpress.com'), { err: null, address: '192.0.78.9', family: 4 })
   const all = await new Promise((resolve) => guarded('mcp.example.com', { all: true }, (err, list) => resolve({ err, list })))
   assert.deepEqual(all, { err: null, list: [{ address: '93.184.216.34', family: 4 }] })
 })
@@ -93,37 +108,55 @@ test('rebinding: each resolution is checked on the answer it hands over, so the 
   assert.equal(calls['rebind.example.com'], 2)
 })
 
-test('ORCH_ALLOW_PRIVATE_UPSTREAMS: exact hosts only', async () => {
-  const allowed = parseAllowedHosts(' Internal-MCP.railway.internal , ,10.0.0.5,[fd00::5]')
-  assert.deepEqual([...allowed].sort(), ['10.0.0.5', 'fd00::5', 'internal-mcp.railway.internal'])
-  assert.equal(hostRefusal('internal-mcp.railway.internal', allowed), null)
-  assert.equal(hostRefusal('INTERNAL-MCP.railway.internal', allowed), null)
-  assert.equal(hostRefusal('10.0.0.5', allowed), null)
-  assert.equal(hostRefusal('[fd00::5]', allowed), null)
-  assert.equal(hostRefusal('other.railway.internal', allowed), 'internal hostname')
-  assert.equal(hostRefusal('10.0.0.6', allowed), 'private address')
+test('ORCH_ALLOW_PRIVATE_UPSTREAMS: exact hosts, optionally scoped to a port', async () => {
+  const allowed = parseAllowedHosts(' Internal-MCP.railway.internal.. , ,10.0.0.5,[fd00::5],fd00::6,ported.railway.internal:8080,ported.railway.internal:9090')
+  assert.deepEqual([...allowed.keys()].sort(), ['10.0.0.5', 'fd00::5', 'fd00::6', 'internal-mcp.railway.internal', 'ported.railway.internal'])
+  assert.equal(hostRefusal('internal-mcp.railway.internal', allowed, '3000'), null)
+  assert.equal(hostRefusal('INTERNAL-MCP.railway.internal.', allowed, '443'), null)
+  assert.equal(hostRefusal('10.0.0.5', allowed, '80'), null)
+  assert.equal(hostRefusal('[fd00::5]', allowed, '80'), null)
+  assert.equal(hostRefusal('other.railway.internal', allowed, '80'), 'internal hostname')
+  assert.equal(hostRefusal('10.0.0.6', allowed, '80'), 'private address')
+  // A port-scoped entry lets only its ports through.
+  assert.equal(isAllowed(allowed, 'ported.railway.internal', '8080'), true)
+  assert.equal(isAllowed(allowed, 'ported.railway.internal', '9090'), true)
+  assert.equal(hostRefusal('ported.railway.internal', allowed, '5432'), 'port not on the allow list')
+  // Also for a public-looking name: the lookup lets a listed host through, so the port is checked here.
+  assert.equal(hostRefusal('svc.example.com', parseAllowedHosts('svc.example.com:8080'), '9000'), 'port not on the allow list')
+  assert.equal(hostRefusal('svc.example.com', parseAllowedHosts('svc.example.com:8080'), '8080'), null)
+  assert.deepEqual([...parseAllowedHosts('[fd00::7]:9000').get('fd00::7')], ['9000'])
   const { lookup } = fakeDns({ 'internal-mcp.railway.internal': ['10.250.0.7'], 'evil.example.com': ['10.250.0.7'] })
   const guarded = createGuardedLookup({ lookup, allowed })
   assert.equal((await lookupResult(guarded, 'internal-mcp.railway.internal')).address, '10.250.0.7')
   assert.ok((await lookupResult(guarded, 'evil.example.com')).err instanceof UpstreamRefusedError)
 })
 
+const FAKE_DISPATCHER = { guarded: true }
+const SIGNAL = new AbortController().signal
+
 /** A fetch stand-in that answers each url from a table, recording what it was asked. */
 function fakeFetch(routes) {
   const asked = []
   const impl = async (url, init) => {
-    asked.push({ url: String(url), method: init.method, headers: new Headers(init.headers), body: init.body, redirect: init.redirect })
+    asked.push({ url: String(url), method: init.method, headers: new Headers(init.headers), body: init.body, redirect: init.redirect, dispatcher: init.dispatcher, signal: init.signal })
     const route = routes[String(url)]
     if (!route) throw new Error(`unexpected fetch ${url}`)
     return new Response(route.body ?? null, { status: route.status ?? 200, headers: route.headers ?? {} })
   }
   return { impl, asked }
 }
+const guarded = (url, init = {}, fetchImpl) => guardedFetch(url, { dispatcher: FAKE_DISPATCHER, ...init }, { fetchImpl })
+
+test('guardedFetch refuses to run without a dispatcher', async () => {
+  const { impl, asked } = fakeFetch({ 'https://mcp.example.com/mcp': { status: 200 } })
+  await assert.rejects(guardedFetch('https://mcp.example.com/mcp', {}, { fetchImpl: impl }), /needs a dispatcher/)
+  assert.equal(asked.length, 0)
+})
 
 test('a redirect to 127.0.0.1 or an internal name is refused before it is fetched', async () => {
-  for (const target of ['http://127.0.0.1:8080/admin', 'http://[::ffff:7f00:1]/', 'http://mcp-orchestrator.railway.internal:3000/', 'http://169.254.169.254/latest/meta-data/']) {
+  for (const target of ['http://127.0.0.1:8080/admin', 'http://[::ffff:7f00:1]/', 'http://mcp-orchestrator.railway.internal:3000/', 'http://169.254.169.254/latest/meta-data/', 'http://localhost../']) {
     const { impl, asked } = fakeFetch({ 'https://mcp.example.com/mcp': { status: 302, headers: { location: target } } })
-    await assert.rejects(guardedFetch('https://mcp.example.com/mcp', { method: 'GET' }, { fetchImpl: impl }), (err) => err instanceof UpstreamRefusedError)
+    await assert.rejects(guarded('https://mcp.example.com/mcp', { method: 'GET' }, impl), (err) => err instanceof UpstreamRefusedError)
     assert.equal(asked.length, 1, target)
     assert.equal(asked[0].redirect, 'manual')
   }
@@ -132,21 +165,25 @@ test('a redirect to 127.0.0.1 or an internal name is refused before it is fetche
 test('a private url is refused without any fetch, and the scheme must be http(s)', async () => {
   const { impl, asked } = fakeFetch({})
   for (const url of ['http://127.0.0.1/', 'http://localhost:3000/', 'http://postgres:5432/', 'file:///etc/passwd']) {
-    await assert.rejects(guardedFetch(url, {}, { fetchImpl: impl }), UpstreamRefusedError, url)
+    await assert.rejects(guarded(url, {}, impl), UpstreamRefusedError, url)
   }
   assert.equal(asked.length, 0)
 })
 
-test('redirects: followed hop by hop up to 5, and credentials or a body never cross to another origin', async () => {
+test('redirects: followed hop by hop up to 5, each hop keeps the signal and dispatcher, and credentials never cross origins', async () => {
   // Five redirects: /1 → /2 → /3 → /4 → /5 → b.example.com.
   const routes = { 'https://a.example.com/1': { status: 307, headers: { location: '/2' } } }
   for (let i = 2; i <= 4; i++) routes[`https://a.example.com/${i}`] = { status: 302, headers: { location: `/${i + 1}` } }
   routes['https://a.example.com/5'] = { status: 301, headers: { location: 'https://b.example.com/end' } }
   routes['https://b.example.com/end'] = { status: 200, body: 'ok' }
   const { impl, asked } = fakeFetch(routes)
-  const res = await guardedFetch('https://a.example.com/1', { method: 'GET', headers: { authorization: 'Bearer row-secret', 'x-api-key': 'row-key', accept: 'application/json' } }, { fetchImpl: impl })
+  const res = await guarded('https://a.example.com/1', { method: 'GET', signal: SIGNAL, headers: { authorization: 'Bearer row-secret', 'x-api-key': 'row-key', accept: 'application/json' } }, impl)
   assert.equal(await res.text(), 'ok')
   assert.equal(asked.length, 6)
+  for (const hop of asked) {
+    assert.equal(hop.signal, SIGNAL)
+    assert.equal(hop.dispatcher, FAKE_DISPATCHER)
+  }
   assert.equal(asked[4].headers.get('x-api-key'), 'row-key')
   const crossed = asked[5].headers
   assert.equal(crossed.get('authorization'), null)
@@ -156,11 +193,46 @@ test('redirects: followed hop by hop up to 5, and credentials or a body never cr
   // A sixth is refused.
   routes['https://a.example.com/5'] = { status: 302, headers: { location: '/6' } }
   routes['https://a.example.com/6'] = { status: 302, headers: { location: 'https://b.example.com/end' } }
-  await assert.rejects(guardedFetch('https://a.example.com/1', {}, { fetchImpl: fakeFetch(routes).impl }), /more than 5 redirects/)
+  await assert.rejects(guarded('https://a.example.com/1', {}, fakeFetch(routes).impl), /more than 5 redirects/)
+})
 
-  const post = fakeFetch({ 'https://a.example.com/token': { status: 307, headers: { location: 'https://c.example.com/token' } } })
-  await assert.rejects(guardedFetch('https://a.example.com/token', { method: 'POST', body: 'client_secret=s' }, { fetchImpl: post.impl }), /another origin with a body/)
-  assert.equal(post.asked.length, 1)
+test('only 301, 302, 303, 307 and 308 are followed: a 300 with a Location is the response, its body never re-sent', async () => {
+  for (const status of [300, 304, 305, 306]) {
+    const { impl, asked } = fakeFetch({ 'https://a.example.com/rpc': { status, headers: { location: 'https://other.example.net/collect' } } })
+    const res = await guarded('https://a.example.com/rpc', { method: 'POST', body: '{"secret":"args"}' }, impl)
+    assert.equal(res.status, status)
+    assert.equal(asked.length, 1, String(status))
+  }
+})
+
+test('a body never follows a 307 or 308 to another origin; a same-host http to https upgrade keeps it', async () => {
+  for (const status of [307, 308]) {
+    const post = fakeFetch({ 'https://a.example.com/token': { status, headers: { location: 'https://c.example.com/token' } } })
+    await assert.rejects(guarded('https://a.example.com/token', { method: 'POST', body: 'client_secret=s' }, post.impl), /another origin with a body/)
+    assert.equal(post.asked.length, 1)
+  }
+  const upgrade = fakeFetch({
+    'http://h.example.com/x': { status: 308, headers: { location: 'https://h.example.com/x' } },
+    'https://h.example.com/x': { status: 200, body: 'ok' },
+  })
+  const res = await guarded('http://h.example.com/x', { method: 'POST', body: 'payload', headers: { 'x-api-key': 'row-key' } }, upgrade.impl)
+  assert.equal(await res.text(), 'ok')
+  assert.equal(upgrade.asked[1].body, 'payload')
+  assert.equal(upgrade.asked[1].headers.get('x-api-key'), 'row-key')
+})
+
+test('credentials are dropped when only the scheme (not an upgrade) or only the port changes', async () => {
+  for (const [from, to] of [
+    ['https://h.example.com/x', 'http://h.example.com/x'],
+    ['https://h.example.com/x', 'https://h.example.com:8443/x'],
+    ['http://h.example.com:8080/x', 'https://h.example.com:8080/x'],
+  ]) {
+    const { impl, asked } = fakeFetch({ [from]: { status: 302, headers: { location: to } }, [new URL(to).href]: { status: 200 } })
+    await guarded(from, { headers: { authorization: 'Bearer row-secret', 'x-api-key': 'row-key', accept: 'application/json' } }, impl)
+    assert.equal(asked[1].headers.get('authorization'), null, `${from} -> ${to}`)
+    assert.equal(asked[1].headers.get('x-api-key'), null, `${from} -> ${to}`)
+    assert.equal(asked[1].headers.get('accept'), 'application/json')
+  }
 })
 
 test('a refusal inside a fetch failure is found through its causes', () => {
