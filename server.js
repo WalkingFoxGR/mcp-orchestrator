@@ -2,6 +2,14 @@ import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 import { Agent } from 'undici'
 import {
+  MAX_REDIRECTS,
+  UpstreamRefusedError,
+  createGuardedLookup,
+  guardedFetch,
+  parseAllowedHosts,
+  refusalIn,
+} from './lib/upstream-guard.js'
+import {
   apifyCacheKey,
   createInboundGuard,
   createRateLimitedLog,
@@ -25,11 +33,19 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 mi
 // AbortSignal, not these two timers. Disable both here and rely solely on
 // AbortSignal.timeout(timeoutMs) for the real overall cap. Connect timeout stays
 // bounded so a dead host fails fast instead of hanging for the full timeout.
+// SSRF guard (lib/upstream-guard.js): every upstream connection resolves its host through
+// guardedLookup, which refuses private, internal and metadata addresses and pins the address it
+// checked. ORCH_ALLOW_PRIVATE_UPSTREAMS lists exact hosts that may be private (an internal upstream).
+const ALLOWED_PRIVATE_UPSTREAMS = parseAllowedHosts(process.env.ORCH_ALLOW_PRIVATE_UPSTREAMS)
+const guardedLookup = createGuardedLookup({ allowed: ALLOWED_PRIVATE_UPSTREAMS })
 const upstreamDispatcher = new Agent({
   headersTimeout: 0,
   bodyTimeout: 0,
-  connect: { timeout: 30_000 },
+  connect: { timeout: 30_000, lookup: guardedLookup },
 })
+// The token fetch keeps undici's default timers; only the lookup is guarded.
+const tokenDispatcher = new Agent({ connect: { timeout: 15_000, lookup: guardedLookup } })
+const upstreamFetch = (url, init) => guardedFetch(url, init, { allowed: ALLOWED_PRIVATE_UPSTREAMS })
 const MAX_ARG_BYTES = Number(process.env.ORCH_MAX_ARG_BYTES || 65536)
 const MAX_RESULT_BYTES = Number(process.env.ORCH_MAX_RESULT_BYTES || 200000)
 const STREAM_RESPONSES = process.env.ORCH_STREAM === 'true'
@@ -321,11 +337,12 @@ async function getOAuthToken(cacheKey, config) {
   if (scope) body.set('scope', scope)
   if (audience) body.set('audience', audience)
 
-  const response = await fetch(tokenUrl, {
+  const response = await upstreamFetch(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
     signal: AbortSignal.timeout(15000),
+    dispatcher: tokenDispatcher,
   })
 
   if (!response.ok) {
@@ -440,6 +457,7 @@ async function ensureUpstreamSession(upstream) {
       // Still continue — some servers may accept tools/call without init
     }
   } catch (initErr) {
+    if (initErr instanceof UpstreamRefusedError) throw initErr
     console.warn(`[orchestrator] initialize failed for ${upstream.name || upstream.url}: ${initErr instanceof Error ? initErr.message : 'unknown'}`)
     // Continue without session — stateless servers or wrappers may still work
     return null
@@ -793,7 +811,7 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
 
   let res
   try {
-    res = await fetch(upstream.url, {
+    res = await upstreamFetch(upstream.url, {
       method: 'POST',
       headers,
       body: JSON.stringify(message),
@@ -801,6 +819,7 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
       dispatcher: upstreamDispatcher,
     })
   } catch (err) {
+    if (err instanceof UpstreamRefusedError) throw err
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[MCP Orchestrator] upstream ${rpcLabel} FAILED after ${elapsed()} (${upstream.name || upstream.url}): ${msg}`)
     throw err
@@ -1148,7 +1167,19 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+/** A refused upstream answers JSON-RPC `upstream_refused` and one log line with the host, never a credential. */
 async function dispatchRequest(req, body) {
+  try {
+    return await dispatchMethod(req, body)
+  } catch (err) {
+    const refused = refusalIn(err)
+    if (!refused) throw err
+    console.warn(`[MCP Orchestrator] upstream_refused ${logLabel(refused.host)}: ${logLabel(refused.reason)} (integration=${integrationLabelOf(req)})`)
+    return { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32001, message: 'upstream_refused', data: { host: refused.host, reason: refused.reason } } }
+  }
+}
+
+async function dispatchMethod(req, body) {
   if (!body || typeof body !== 'object') {
     return buildJsonRpcError(null, 'Invalid request body', -32600)
   }
@@ -1186,6 +1217,7 @@ async function dispatchRequest(req, body) {
 server.listen(PORT, () => {
   console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
+  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS).map(logLabel).join(', ') : 'none'}`)
   if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
   else console.warn(inboundGuard.startupLine)
 })
