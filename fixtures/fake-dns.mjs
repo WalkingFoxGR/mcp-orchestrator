@@ -1,4 +1,5 @@
-// Preloaded into the server under test (--import): one name that resolves to 127.0.0.1, so a
+// Preloaded into the server under test by test/server-ssrf.test.js (--import; outside test/, which
+// node --test would run as a test file): one name that resolves to 127.0.0.1, so a
 // hostname the static checks pass is refused at connect time by the guarded lookup.
 import dns from 'node:dns'
 

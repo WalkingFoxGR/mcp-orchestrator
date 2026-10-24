@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 
 const KEY = 'test-inbound-key-0123456789abcdef'
 const SERVER = fileURLToPath(new URL('../server.js', import.meta.url))
-const FAKE_DNS = fileURLToPath(new URL('./fixtures/fake-dns.mjs', import.meta.url))
+const FAKE_DNS = fileURLToPath(new URL('../fixtures/fake-dns.mjs', import.meta.url))
 const TOKEN_ROW = '33333333-3333-4333-8333-333333333333'
 const SECRET = 'client-secret-never-logged'
 
