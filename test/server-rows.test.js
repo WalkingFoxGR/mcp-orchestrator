@@ -12,6 +12,8 @@ const ROW_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const ROW_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const APIFY_A = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 const APIFY_B = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+// A row whose read never answers: the database stalls instead of failing.
+const STALLED = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
 
 const listen = (handler) => new Promise((resolve) => {
   const server = http.createServer(handler)
@@ -62,6 +64,7 @@ before(async () => {
     [APIFY_B]: { name: 'Apify B', config: { url: mcpUrl('apify-b'), authType: 'none' } },
   }
   db = await listen((req, res) => {
+    if (req.url.includes(`id=eq.${STALLED}`)) return
     const id = Object.keys(rows).find((key) => req.url.startsWith('/rest/v1/agent_integrations') && req.url.includes(`id=eq.${key}`))
     if (id) {
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -76,11 +79,15 @@ before(async () => {
     SUPABASE_URL: `http://127.0.0.1:${db.address().port}`,
     SUPABASE_SERVICE_ROLE_KEY: 'test-service-key',
     ORCH_ALLOW_PRIVATE_UPSTREAMS: '127.0.0.1',
+    SUPABASE_READ_TIMEOUT_MS: '300',
   })
 })
 after(() => {
   orch?.child.kill()
-  for (const s of [db, token, mcp]) s?.close()
+  for (const s of [db, token, mcp]) {
+    s?.closeAllConnections()
+    s?.close()
+  }
 })
 
 const callTool = async (row, name, args = {}) => (await fetch(orch.url, {
@@ -105,4 +112,11 @@ test('an Apify dataset id cached for one row is never injected into another row\
   const outputs = calls.filter((c) => c.name === 'get-actor-output').map((c) => [c.row, c.args.datasetId])
   // Row B started no run: its placeholder stays. Row A gets the dataset of its own run.
   assert.deepEqual(outputs, [['apify-b', 'your-dataset-id-here'], ['apify-a', 'dataset-apify-a']])
+})
+
+test('a row read that stalls fails after SUPABASE_READ_TIMEOUT_MS instead of holding the request', { timeout: 5000 }, async () => {
+  const started = Date.now()
+  const reply = await callTool(STALLED, 'get_orders')
+  assert.deepEqual(reply.error, { code: -32603, message: 'The MCP integration could not be read just now; try again' })
+  assert.ok(Date.now() - started < 3000)
 })

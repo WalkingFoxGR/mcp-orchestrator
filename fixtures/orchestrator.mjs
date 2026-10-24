@@ -23,5 +23,10 @@ export async function startOrchestrator(env, { nodeArgs = [] } = {}) {
       if (m) { clearTimeout(timer); setTimeout(() => resolve(Number(m[1])), 20) }
     })
   })
-  return { url: `http://127.0.0.1:${port}`, child, output: () => output }
+  // A log line can arrive on the pipe after the HTTP answer it belongs to: wait for it.
+  const waitFor = async (pattern, ms = 1000) => {
+    for (const end = Date.now() + ms; !pattern.test(output) && Date.now() < end;) await new Promise((r) => setTimeout(r, 10))
+    return output
+  }
+  return { url: `http://127.0.0.1:${port}`, child, output: () => output, waitFor }
 }

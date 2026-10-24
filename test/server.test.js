@@ -55,7 +55,7 @@ test('with a key set: /health is open, everything else needs the key', async () 
 
 test('refusals are logged once per address per minute, without the key', async () => {
   await rpc(keyed.url, { 'x-orchestrator-key': `${KEY}-nearly` })
-  const lines = keyed.output().split('\n').filter((l) => l.includes(' 401 '))
+  const lines = (await keyed.waitFor(/ 401 /)).split('\n').filter((l) => l.includes(' 401 '))
   assert.equal(lines.length, 1)
   assert.match(lines[0], /401 POST \/ from (::ffff:)?127\.0\.0\.1: inbound key missing/)
   assert.ok(!keyed.output().includes(KEY))
@@ -78,7 +78,7 @@ test('no key but a service key: fails closed, /health still answers', async () =
     assert.equal(res.status, 401)
     assert.deepEqual(await res.json(), { error: 'Unauthorized' })
   }
-  assert.match(closed.output(), /inbound key not configured/)
+  assert.match(await closed.waitFor(/inbound key not configured/), /inbound key not configured/)
 })
 
 test('no key, a service key and ORCH_ALLOW_UNAUTHENTICATED=true: open, and says so', async () => {

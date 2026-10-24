@@ -38,20 +38,21 @@ test('every refused address class, in any textual form', () => {
   const refused = [
     '127.0.0.1', '127.8.9.10', '0.0.0.0', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1',
     '169.254.169.254', '169.254.1.1', '100.64.0.1', '100.127.255.254', '192.0.0.1', '192.0.0.170', '192.0.2.10',
-    '224.0.0.1', '255.255.255.255',
+    '198.18.0.1', '198.19.255.255', '224.0.0.1', '255.255.255.255',
     '::1', '::', '[::1]', '0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001', '::7f00:1',
     'fe80::1', 'febf::1', 'fec0::1', 'fc00::1', 'fd12:3456::1', 'fd00:ec2::254', 'FD00:EC2:0:0:0:0:0:254', 'ff02::1',
     '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', '::ffff:a9fe:a9fe', '::ffff:10.0.0.1',
+    '::ffff:0:7f00:1', '::ffff:0:a9fe:a9fe', '::ffff:0:10.0.0.1',
     '64:ff9b::a9fe:a9fe', '64:ff9b::127.0.0.1', '64:ff9b:1::a9fe:a9fe', '64:ff9b:1:abcd::1',
     '2002:a9fe:a9fe::1', '2002:7f00:1::', '2002:c0a8:101::1', '2001:0:4136:e378:8000:63bf:3fff:fdd2', '2001::1', '2001:db8::1',
     'fe80::1%eth0', 'not-an-ip',
   ]
   for (const ip of refused) assert.equal(isPrivateIp(ip), true, ip)
   const allowed = [
-    '93.184.216.34', '8.8.8.8', '100.63.255.255', '100.128.0.1', '172.32.0.1',
+    '93.184.216.34', '8.8.8.8', '100.63.255.255', '100.128.0.1', '172.32.0.1', '198.17.255.255', '198.20.0.1',
     // WordPress.com, Jetpack, WooCommerce, IANA: public hosting inside 192.0.0.0/16.
     '192.0.78.9', '192.0.66.5', '192.0.43.8', '192.0.1.1', '192.0.3.1',
-    '2606:4700::6810:84e5', '::ffff:93.184.216.34', '64:ff9b::c000:4e09', '64:ff9b::192.0.78.9', '2002:5db8:d822::1', '2001:4860:4860::8888',
+    '2606:4700::6810:84e5', '::ffff:93.184.216.34', '::ffff:0:5db8:d822', '64:ff9b::c000:4e09', '64:ff9b::192.0.78.9', '2002:5db8:d822::1', '2001:4860:4860::8888',
   ]
   for (const ip of allowed) assert.equal(isPrivateIp(ip), false, ip)
 })
@@ -97,6 +98,17 @@ test('a name that resolves to a private or metadata address is refused', async (
   }
   const { err } = await lookupResult(guarded, 'mcp-orchestrator.railway.internal')
   assert.equal(err.reason, 'internal hostname')
+})
+
+test('one DNS answer mixing a public and a private address is refused, whichever comes first', async () => {
+  for (const answers of [['93.184.216.34', '127.0.0.1'], ['127.0.0.1', '93.184.216.34']]) {
+    const lookup = (host, options, callback) => process.nextTick(callback, null, answers.map((address) => ({ address, family: 4 })))
+    const guarded = createGuardedLookup({ lookup })
+    const all = await new Promise((resolve) => guarded('mixed.example.com', { all: true }, (err, list) => resolve({ err, list })))
+    assert.ok(all.err instanceof UpstreamRefusedError, answers.join(','))
+    assert.equal(all.list, undefined)
+    assert.ok((await lookupResult(guarded, 'mixed.example.com')).err instanceof UpstreamRefusedError)
+  }
 })
 
 test('rebinding: each resolution is checked on the answer it hands over, so the private second answer is refused', async () => {
@@ -220,6 +232,18 @@ test('a body never follows a 307 or 308 to another origin; a same-host http to h
   assert.equal(await res.text(), 'ok')
   assert.equal(upgrade.asked[1].body, 'payload')
   assert.equal(upgrade.asked[1].headers.get('x-api-key'), 'row-key')
+  // Not an upgrade: http to https on another host, or onto another port. The body and the
+  // credentials stay behind: a 308 is refused, and a 302 goes on as a bare GET.
+  for (const to of ['https://b.example.com/x', 'https://h.example.com:8443/x']) {
+    const kept = fakeFetch({ 'http://h.example.com/x': { status: 308, headers: { location: to } } })
+    await assert.rejects(guarded('http://h.example.com/x', { method: 'POST', body: 'payload', headers: { 'x-api-key': 'row-key' } }, kept.impl), /another origin with a body/, to)
+    assert.equal(kept.asked.length, 1)
+    const moved = fakeFetch({ 'http://h.example.com/x': { status: 302, headers: { location: to } }, [to]: { status: 200 } })
+    await guarded('http://h.example.com/x', { method: 'POST', body: 'payload', headers: { 'x-api-key': 'row-key' } }, moved.impl)
+    assert.equal(moved.asked[1].method, 'GET', to)
+    assert.equal(moved.asked[1].body, undefined, to)
+    assert.equal(moved.asked[1].headers.get('x-api-key'), null, to)
+  }
 })
 
 test('credentials are dropped when only the scheme (not an upgrade) or only the port changes', async () => {
@@ -254,8 +278,9 @@ after(() => local?.close())
 
 test('through a real undici Agent: a name resolving to 127.0.0.1 is refused with no connection, unless allowed', async () => {
   const port = local.address().port
-  const { lookup } = fakeDns({ 'rebind.example.com': ['127.0.0.1'], 'internal-mcp.example.com': ['127.0.0.1'] })
-  const allowed = parseAllowedHosts('internal-mcp.example.com')
+  const { lookup } = fakeDns({ 'rebind.example.com': ['127.0.0.1'], 'internal-mcp.example.com': ['127.0.0.1'], 'svc.railway.internal': ['127.0.0.1'] })
+  // One entry for any port, one scoped to the port (the form the README recommends).
+  const allowed = parseAllowedHosts(`internal-mcp.example.com,svc.railway.internal:${port}`)
   const dispatcher = new Agent({ connect: { lookup: createGuardedLookup({ lookup, allowed }) } })
   try {
     hits = 0
@@ -267,6 +292,9 @@ test('through a real undici Agent: a name resolving to 127.0.0.1 is refused with
     const ok = await guardedFetch(`http://internal-mcp.example.com:${port}/`, { dispatcher }, { allowed })
     assert.equal(await ok.text(), 'reached')
     assert.equal(hits, 1)
+    const scoped = await guardedFetch(`http://svc.railway.internal:${port}/`, { dispatcher }, { allowed })
+    assert.equal(await scoped.text(), 'reached')
+    assert.equal(hits, 2)
   } finally {
     await dispatcher.close()
   }

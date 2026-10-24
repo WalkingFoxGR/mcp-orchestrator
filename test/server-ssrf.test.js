@@ -90,17 +90,17 @@ test('a static upstream on 127.0.0.1 answers upstream_refused, logs one line wit
   // -32010, not the SDK's -32001 RequestTimeout; one generic message, no host or reason.
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
   assert.equal(mcpHits, 0)
-  const lines = s.output().split('\n').filter((l) => l.includes('upstream_refused'))
+  const lines = (await s.waitFor(/upstream_refused 127/)).split('\n').filter((l) => l.includes('upstream_refused'))
   assert.equal(lines.length, 1)
   assert.match(lines[0], /upstream_refused 127\.0\.0\.1: private address/)
-  assert.match(s.output(), /Upstream SSRF guard on \(at most 5 redirects\); private hosts allowed: none/)
+  assert.match(await s.waitFor(/Upstream SSRF guard on \(at most 5 redirects\); private hosts allowed: none/), /Upstream SSRF guard on \(at most 5 redirects\); private hosts allowed: none/)
 })
 
 test('the client-credentials token fetch is guarded too, and the secret is never logged or answered', async () => {
   const s = await start({})
   const reply = await call(s.url, { 'x-mcp-integration-id': TOKEN_ROW })
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused 169\.254\.169\.254: private address/)
+  assert.match(await s.waitFor(/upstream_refused 169\.254\.169\.254: private address/), /upstream_refused 169\.254\.169\.254: private address/)
   assert.ok(!s.output().includes(SECRET))
   assert.ok(!JSON.stringify(reply).includes(SECRET))
 })
@@ -109,7 +109,7 @@ test('a token url whose name resolves to 127.0.0.1 is refused by the token fetch
   const s = await start({})
   const reply = await call(s.url, { 'x-mcp-integration-id': TOKEN_DNS_ROW })
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused token\.example\.invalid: resolves to a private address/)
+  assert.match(await s.waitFor(/upstream_refused token\.example\.invalid: resolves to a private address/), /upstream_refused token\.example\.invalid: resolves to a private address/)
   assert.ok(!s.output().includes(SECRET))
 })
 
@@ -117,7 +117,7 @@ test('a wrapper url with no scheme is checked as the https url it is fetched as'
   const s = await start({})
   const reply = await call(s.url, { 'x-mcp-integration-id': SCHEMELESS_ROW })
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused mcp-wrapper\.example\.invalid: resolves to a private address/)
+  assert.match(await s.waitFor(/upstream_refused mcp-wrapper\.example\.invalid: resolves to a private address/), /upstream_refused mcp-wrapper\.example\.invalid: resolves to a private address/)
   assert.ok(!/Invalid URL/i.test(s.output()))
 })
 
@@ -130,7 +130,22 @@ test('ORCH_ALLOW_PRIVATE_UPSTREAMS lets an exact host through', async () => {
   const reply = await call(s.url)
   assert.equal(reply.error, undefined)
   assert.ok(mcpHits > 0)
-  assert.match(s.output(), /private hosts allowed: 127\.0\.0\.1 \(any port\)/)
+  assert.match(await s.waitFor(/private hosts allowed: 127\.0\.0\.1 \(any port\)/), /private hosts allowed: 127\.0\.0\.1 \(any port\)/)
+})
+
+test('an error that is not a refusal keeps its old answer: an allow-listed host on a closed port fails as fetch failed', async () => {
+  const s = await start({
+    MCP_UPSTREAMS: JSON.stringify([{ name: 'closed', url: 'http://127.0.0.1:9/mcp' }]),
+    ORCH_ALLOW_PRIVATE_UPSTREAMS: '127.0.0.1:9',
+  })
+  const res = await fetch(s.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-orchestrator-key': KEY },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'get_contacts', arguments: {} } }),
+  })
+  assert.equal(res.status, 500)
+  assert.deepEqual(await res.json(), { error: 'fetch failed' })
+  assert.ok(!s.output().includes('upstream_refused'))
 })
 
 test('a name the static checks pass but that resolves to 127.0.0.1 is refused at connect time (the pinned lookup)', async () => {
@@ -138,7 +153,7 @@ test('a name the static checks pass but that resolves to 127.0.0.1 is refused at
   mcpHits = 0
   const reply = await call(s.url)
   assert.deepEqual(reply.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused rebind\.example\.invalid: resolves to a private address/)
+  assert.match(await s.waitFor(/upstream_refused rebind\.example\.invalid: resolves to a private address/), /upstream_refused rebind\.example\.invalid: resolves to a private address/)
   assert.equal(mcpHits, 0)
 })
 
@@ -150,17 +165,17 @@ test('the orchestrator\'s own Railway names are refused as upstreams, even when 
     MCP_UPSTREAMS: JSON.stringify([{ name: 'self', url: 'http://orch-self.railway.internal:9/' }]),
     ORCH_ALLOW_PRIVATE_UPSTREAMS: 'orch-self.railway.internal:9,orch-self.example.com',
   })
-  assert.match(s.output(), /own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal, orch-static\.example\.com/)
+  assert.match(await s.waitFor(/own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal, orch-static\.example\.com/), /own hosts refused: orch-self\.example\.com, orch-self\.railway\.internal, orch-static\.example\.com/)
   // The self-loop row: its url is the public domain, its custom headers name another row.
   const byRow = await call(s.url, { 'x-mcp-integration-id': SELF_ROW })
   assert.deepEqual(byRow.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused orch-self\.example\.com: the orchestrator itself/)
+  assert.match(await s.waitFor(/upstream_refused orch-self\.example\.com: the orchestrator itself/), /upstream_refused orch-self\.example\.com: the orchestrator itself/)
   // The private name, through MCP_UPSTREAMS, although ORCH_ALLOW_PRIVATE_UPSTREAMS lists it.
   const byStatic = await call(s.url)
   assert.deepEqual(byStatic.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused orch-self\.railway\.internal: the orchestrator itself/)
+  assert.match(await s.waitFor(/upstream_refused orch-self\.railway\.internal: the orchestrator itself/), /upstream_refused orch-self\.railway\.internal: the orchestrator itself/)
   // The legacy RAILWAY_STATIC_URL, given as a url, counts by its hostname.
   const byStaticUrl = await call(s.url, { 'x-mcp-integration-id': STATIC_URL_ROW })
   assert.deepEqual(byStaticUrl.error, { code: -32010, message: 'upstream_refused' })
-  assert.match(s.output(), /upstream_refused orch-static\.example\.com: the orchestrator itself/)
+  assert.match(await s.waitFor(/upstream_refused orch-static\.example\.com: the orchestrator itself/), /upstream_refused orch-static\.example\.com: the orchestrator itself/)
 })

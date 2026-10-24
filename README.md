@@ -26,27 +26,31 @@ never be reachable by anyone but Nexus.
   and has a URL. `is_active` is not checked: it is the chat toggle, and Nexus decides which rows it
   calls. `x-mcp-integration-name` appears in log lines only. A row is cached by id for
   `SUPABASE_INTEGRATIONS_CACHE_TTL_MS`, so an edited row takes effect within it; if the database
-  cannot be read when the entry expires, the cached row keeps being served (retried every 30 s) for
-  at most an hour after its last good read, and an id with no row is remembered for 10 s.
-  Concurrent requests for one id share one database read. Upstream sessions, client-credentials tokens and Apify
-  run ids are kept per integration id.
+  cannot be read when the entry expires, the cached row keeps being served (retried every 30 s),
+  never past an hour after its last good read, and an id with no row is remembered for 10 s.
+  Concurrent requests for one id share one database read, which fails after
+  `SUPABASE_READ_TIMEOUT_MS` (10 s) rather than stall. Upstream sessions, client-credentials tokens
+  and Apify run ids are kept per integration id.
 
 - **Upstreams must be public.** Every upstream fetch (initialize, tools/list, tools/call, the
   client-credentials token fetch) refuses loopback, private, link-local, CGNAT (100.64/10),
   192.0.0.0/24, documentation and multicast addresses; unique-local, link-local, site-local, Teredo,
-  local-use NAT64 and documentation IPv6, and IPv4-mapped, NAT64 or 6to4 IPv6 that embeds a refused
+  local-use NAT64 and documentation IPv6, and IPv4-mapped, IPv4-translated, NAT64 or 6to4 IPv6 that embeds a refused
   IPv4 (any textual form); cloud metadata (169.254.169.254, fd00:ec2::254); and the hostnames
   `localhost`, `*.localhost`, `*.local`, `*.internal` (Railway's private network) and any
   single-label name. The orchestrator's own names (`RAILWAY_PUBLIC_DOMAIN`,
-  `RAILWAY_PRIVATE_DOMAIN`, and the legacy `RAILWAY_STATIC_URL` when set) are refused too, whatever they resolve to, even when allow-listed: a row pointing
-  back at the orchestrator would call it with that row's custom headers. A custom domain on this
-  service is not covered; it should have none. A name is checked on the addresses the connection actually dials (a guarded
+  `RAILWAY_PRIVATE_DOMAIN`, and the legacy `RAILWAY_STATIC_URL` when set) are refused too, whatever
+  they resolve to, even when allow-listed: a row pointing back at the orchestrator would call it
+  with that row's custom headers. A custom domain or a TCP proxy on this service is not covered; it
+  should have neither. A name is checked on the addresses the connection actually dials (a guarded
   lookup on the undici Agent), so DNS rebinding between a check and the connect does not get
   through. Only 301, 302, 303, 307 and 308 are followed, by hand, at most 5, each hop checked again;
   a hop to another origin keeps only `Accept` and `Content-Type`, and a request body never follows
   one (a same-host http to https upgrade on the default ports counts as the same origin). A refused
   upstream answers JSON-RPC `-32010 upstream_refused` (not -32001, the MCP SDK's timeout code) and
-  logs one line with the host and the reason, never a credential.
+  logs one line with the host and the reason, never a credential. The answer gives neither the host
+  nor the reason, but it still differs from a name that does not resolve (a fetch error), so a
+  tenant can tell whether their own name resolved to a private address.
 - **`ORCH_ALLOW_PRIVATE_UPSTREAMS` is a hole by design.** A listed host skips the address check, for
   every tenant: any integration may then point at it. List only operator-owned Railway services
   (`name.railway.internal`), never a DNS name a tenant controls (they could repoint it at the
@@ -101,6 +105,7 @@ it (the self-call never carries it).
 - `SUPABASE_TABLE`: optional (default `mcp_tool_cache`).
 - `SUPABASE_INTEGRATIONS_TABLE`: optional (default `agent_integrations`).
 - `SUPABASE_INTEGRATIONS_CACHE_TTL_MS`: optional (default `300000`).
+- `SUPABASE_READ_TIMEOUT_MS`: optional (default `10000`): an integration row read that takes longer fails, and the cached row is served instead.
 
 Example `MCP_UPSTREAMS` (optional when auto-discovery is enabled):
 

@@ -272,6 +272,18 @@ test('a cached entry is served through a read outage for at most an hour after i
   assert.match(logs.at(-1), /could not be read \(connection reset\)$/)
 })
 
+test('a failed retry just before the hour does not stretch the stale row past it', async () => {
+  const { resolver, fetched, db, tick } = world([row(A)])
+  await resolver.resolve({ 'x-mcp-integration-id': A }, '')
+  db.down = true
+  tick(60 * 60_000 - 10_000)
+  assert.equal((await resolver.resolve({ 'x-mcp-integration-id': A }, '')).upstream.integrationId, A)
+  // Without the cap this would be served from the cache until 60:20, with no read.
+  tick(10_001)
+  assert.deepEqual(await resolver.resolve({ 'x-mcp-integration-id': A }, ''), { upstream: null, reason: 'lookup_failed' })
+  assert.equal(fetched.length, 3)
+})
+
 test('concurrent resolves of one id share one database read', async () => {
   let release
   const gate = new Promise((resolve) => { release = resolve })

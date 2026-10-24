@@ -58,6 +58,9 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABA
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mcp_tool_cache'
 const SUPABASE_INTEGRATIONS_TABLE = process.env.SUPABASE_INTEGRATIONS_TABLE || 'agent_integrations'
 const SUPABASE_INTEGRATIONS_CACHE_TTL_MS = Number(process.env.SUPABASE_INTEGRATIONS_CACHE_TTL_MS || 300000)
+// A row read that stalls becomes an error after this long (supabase-js retries included), so the
+// one shared read per id never holds every request for that id for minutes.
+const SUPABASE_READ_TIMEOUT_MS = Number(process.env.SUPABASE_READ_TIMEOUT_MS) || 10_000
 const AUTO_DISCOVER_UPSTREAMS = process.env.ORCH_AUTO_DISCOVER !== 'false'
 const UPSTREAMS = parseJson(process.env.MCP_UPSTREAMS || process.env.UPSTREAMS || '[]') || []
 const APIFY_DATASET_CACHE_TTL_MS = Number(process.env.APIFY_DATASET_CACHE_TTL_MS || 600000)
@@ -402,6 +405,7 @@ async function fetchIntegrationById(integrationId) {
     .from(SUPABASE_INTEGRATIONS_TABLE)
     .select('id,name,config,integration_type,is_active,is_verified,updated_at')
     .eq('id', integrationId)
+    .abortSignal(AbortSignal.timeout(SUPABASE_READ_TIMEOUT_MS))
     .maybeSingle()
   // A read error throws, so the resolver can tell it from a missing row.
   if (error) throw new Error(error.message || 'Integration lookup failed')
@@ -1184,7 +1188,8 @@ async function dispatchRequest(req, body) {
     console.warn(`[MCP Orchestrator] upstream_refused ${logLabel(refused.host)}: ${logLabel(refused.reason)} (integration=${integrationLabelOf(req)})`)
     // -32010: a plain server error. Not -32001 (the MCP SDK's RequestTimeout, which Nexus reads as
     // "still running, retry") nor -32000/-32002/-32042. One generic message: the host and the reason
-    // stay in the log line, so the answer tells nobody which internal names exist.
+    // stay in the log line. The outcome still differs from a name that does not resolve (that one
+    // fails as a fetch error), so a tenant can tell whether their own name resolved privately.
     return { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32010, message: 'upstream_refused' } }
   }
 }
