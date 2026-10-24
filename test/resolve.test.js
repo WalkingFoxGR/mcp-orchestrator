@@ -47,7 +47,13 @@ function world(rows, opts = {}) {
   return { resolver, fetched, logs, db, tick: (ms) => { clock += ms } }
 }
 
-const guard = (raw, opts = {}) => createInboundGuard({ keys: parseInboundKeys(raw), serviceKeyConfigured: true, ...opts })
+const OLD_KEY = 'old-key-'.padEnd(40, 'o')
+const NEW_KEY = 'new-key-'.padEnd(40, 'n')
+
+const guard = (raw, opts = {}) => {
+  const { keys, ignored } = parseInboundKeys(raw)
+  return createInboundGuard({ keys, ignoredKeys: ignored, serviceKeyConfigured: true, ...opts })
+}
 
 test('inbound key: missing and wrong are refused, right passes', () => {
   const { mode, check } = guard(KEY)
@@ -61,15 +67,40 @@ test('inbound key: missing and wrong are refused, right passes', () => {
 })
 
 test('inbound key: the env value is trimmed, and a comma list accepts each key for rotation', () => {
-  assert.deepEqual(parseInboundKeys(` ${KEY}\n`), [KEY])
-  assert.deepEqual(parseInboundKeys(' old-key , ,new-key,'), ['old-key', 'new-key'])
-  assert.deepEqual(parseInboundKeys(' , \n'), [])
+  assert.deepEqual(parseInboundKeys(` ${KEY}\n`), { keys: [KEY], ignored: 0 })
+  assert.deepEqual(parseInboundKeys(` ${OLD_KEY} , ,${NEW_KEY},`), { keys: [OLD_KEY, NEW_KEY], ignored: 0 })
+  assert.deepEqual(parseInboundKeys(' , \n'), { keys: [], ignored: 0 })
   assert.deepEqual(guard(` ${KEY}\n`).check({ 'x-orchestrator-key': KEY }), { ok: true })
-  const rotating = guard('old-key,new-key')
-  assert.deepEqual(rotating.check({ 'x-orchestrator-key': 'old-key' }), { ok: true })
-  assert.deepEqual(rotating.check({ 'x-orchestrator-key': 'new-key' }), { ok: true })
-  assert.deepEqual(rotating.check({ 'x-orchestrator-key': 'old-key,new-key' }), { ok: false, reason: 'wrong' })
+  const rotating = guard(`${OLD_KEY},${NEW_KEY}`)
+  assert.deepEqual(rotating.check({ 'x-orchestrator-key': OLD_KEY }), { ok: true })
+  assert.deepEqual(rotating.check({ 'x-orchestrator-key': NEW_KEY }), { ok: true })
+  assert.deepEqual(rotating.check({ 'x-orchestrator-key': `${OLD_KEY},${NEW_KEY}` }), { ok: false, reason: 'wrong' })
   assert.match(rotating.startupLine, /2 keys accepted/)
+  assert.equal(rotating.ignoredLine, null)
+})
+
+test('inbound key: an entry under 32 characters is ignored with a warning; with none left it fails closed', () => {
+  // A rotation typo: '<current>,x' must not accept 'x'.
+  assert.deepEqual(parseInboundKeys(`${KEY},x, ${'y'.repeat(31)} `), { keys: [KEY], ignored: 2 })
+  assert.deepEqual(parseInboundKeys('k'.repeat(32)), { keys: ['k'.repeat(32)], ignored: 0 })
+  const typo = guard(`${KEY},x`)
+  assert.equal(typo.mode, 'key')
+  assert.deepEqual(typo.check({ 'x-orchestrator-key': 'x' }), { ok: false, reason: 'wrong' })
+  assert.deepEqual(typo.check({ 'x-orchestrator-key': KEY }), { ok: true })
+  assert.match(typo.startupLine, /1 key accepted/)
+  assert.match(typo.ignoredLine, /WARNING: 1 ORCH_INBOUND_KEY entry is shorter than 32 characters and ignored/)
+  // Only short entries: counted as unset, and closed even with no service key.
+  for (const serviceKeyConfigured of [true, false]) {
+    const { keys, ignored } = parseInboundKeys('short-one,short-two')
+    const closed = createInboundGuard({ keys, ignoredKeys: ignored, serviceKeyConfigured })
+    assert.equal(closed.mode, 'closed')
+    assert.deepEqual(closed.check({ 'x-orchestrator-key': 'short-one' }), { ok: false, reason: 'not configured' })
+    assert.match(closed.startupLine, /has no entry of at least 32 characters\. Every request but \/health is refused/)
+    assert.match(closed.ignoredLine, /2 ORCH_INBOUND_KEY entries are shorter than 32 characters/)
+    assert.ok(!closed.ignoredLine.includes('short-one') && !closed.startupLine.includes('short-one'))
+  }
+  // ORCH_ALLOW_UNAUTHENTICATED=true still opens it, as it would with no key at all.
+  assert.equal(guard('short', { allowUnauthenticated: true }).mode, 'open')
 })
 
 test('inbound key unset with a service key: every request is refused, unless explicitly allowed', () => {
@@ -112,11 +143,15 @@ test('the refusal log: one line per address per minute, then a count of what was
   assert.deepEqual(lines, ['refused', 'refused other', 'refused again (3 more from this address suppressed)', 'quiet'])
 })
 
-test('the refusal log stays bounded however many addresses knock', () => {
+test('the refusal log stays bounded: past maxKeys the oldest address is evicted and logged again', () => {
   const lines = []
   const log = createRateLimitedLog({ windowMs: 60_000, log: (l) => lines.push(l), now: () => 0, maxKeys: 3 })
-  for (let i = 0; i < 10; i++) log(`a${i}`, `line ${i}`)
-  assert.equal(lines.length, 10)
+  for (let i = 0; i < 4; i++) log(`a${i}`, `line ${i}`)
+  // a3 evicted a0 (nothing had expired): a0 is new again inside its window, and is logged.
+  log('a0', 'a0 again')
+  // a0 in turn evicted a1; a2 is still held, so it stays quiet.
+  log('a2', 'a2 again')
+  assert.deepEqual(lines, ['line 0', 'line 1', 'line 2', 'line 3', 'a0 again'])
 })
 
 test('resolves by integration id only, with that row\'s url and credentials', async () => {
@@ -221,6 +256,54 @@ test('a read error on refresh keeps serving the expired entry, logs one line, an
   tick(2)
   assert.equal((await resolver.resolve({ 'x-mcp-integration-id': A }, '')).upstream.url, 'https://moved.example/mcp')
   assert.equal(fetched.length, 3)
+})
+
+test('a cached entry is served through a read outage for at most an hour after its last good read', async () => {
+  const { resolver, logs, db, tick } = world([row(A)])
+  await resolver.resolve({ 'x-mcp-integration-id': A }, '')
+  db.down = true
+  tick(60 * 60_000)
+  assert.equal((await resolver.resolve({ 'x-mcp-integration-id': A }, '')).upstream.integrationId, A)
+  tick(30_001)
+  assert.deepEqual(await resolver.resolve({ 'x-mcp-integration-id': A }, ''), { upstream: null, reason: 'lookup_failed' })
+  assert.match(logs.at(-1), /older than 60 min and dropped/)
+  // Dropped, not kept: the next failing read has nothing to serve either.
+  assert.deepEqual(await resolver.resolve({ 'x-mcp-integration-id': A }, ''), { upstream: null, reason: 'lookup_failed' })
+  assert.match(logs.at(-1), /could not be read \(connection reset\)$/)
+})
+
+test('a failed retry just before the hour does not stretch the stale row past it', async () => {
+  const { resolver, fetched, db, tick } = world([row(A)])
+  await resolver.resolve({ 'x-mcp-integration-id': A }, '')
+  db.down = true
+  tick(60 * 60_000 - 10_000)
+  assert.equal((await resolver.resolve({ 'x-mcp-integration-id': A }, '')).upstream.integrationId, A)
+  // Without the cap this would be served from the cache until 60:20, with no read.
+  tick(10_001)
+  assert.deepEqual(await resolver.resolve({ 'x-mcp-integration-id': A }, ''), { upstream: null, reason: 'lookup_failed' })
+  assert.equal(fetched.length, 3)
+})
+
+test('concurrent resolves of one id share one database read', async () => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const fetched = []
+  const { resolver, tick } = world([], {
+    fetchIntegrationById: async (id) => {
+      fetched.push(id)
+      await gate
+      return row(id)
+    },
+  })
+  const pending = [A, A, A, B].map((id) => resolver.resolve({ 'x-mcp-integration-id': id }, ''))
+  release()
+  const results = await Promise.all(pending)
+  assert.deepEqual(results.map((r) => r.upstream.integrationId), [A, A, A, B])
+  assert.deepEqual(fetched, [A, B])
+  // Once settled, the shared read is forgotten: after the TTL the next resolve reads again.
+  tick(300_001)
+  await resolver.resolve({ 'x-mcp-integration-id': A }, '')
+  assert.deepEqual(fetched, [A, B, A])
 })
 
 test('a read error with nothing cached answers lookup_failed, not not_found, and is not remembered', async () => {

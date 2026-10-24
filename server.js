@@ -2,6 +2,15 @@ import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 import { Agent } from 'undici'
 import {
+  MAX_REDIRECTS,
+  UpstreamRefusedError,
+  createGuardedLookup,
+  guardedFetch,
+  parseAllowedHosts,
+  parseOwnHosts,
+  refusalIn,
+} from './lib/upstream-guard.js'
+import {
   apifyCacheKey,
   createInboundGuard,
   createRateLimitedLog,
@@ -25,11 +34,22 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.ORCH_TIMEOUT_MS) || 300000 // 5 mi
 // AbortSignal, not these two timers. Disable both here and rely solely on
 // AbortSignal.timeout(timeoutMs) for the real overall cap. Connect timeout stays
 // bounded so a dead host fails fast instead of hanging for the full timeout.
+// SSRF guard (lib/upstream-guard.js): every upstream connection resolves its host through
+// guardedLookup, which refuses private, internal and metadata addresses and pins the address it
+// checked. ORCH_ALLOW_PRIVATE_UPSTREAMS lists exact hosts that may be private (an internal upstream).
+// The orchestrator's own Railway names are never an upstream, listed or not: a row pointing back at
+// it would call it with that row's custom headers (a self-loop).
+const ALLOWED_PRIVATE_UPSTREAMS = parseAllowedHosts(process.env.ORCH_ALLOW_PRIVATE_UPSTREAMS)
+const OWN_HOSTS = parseOwnHosts(process.env.RAILWAY_PUBLIC_DOMAIN, process.env.RAILWAY_PRIVATE_DOMAIN, process.env.RAILWAY_STATIC_URL)
+const guardedLookup = createGuardedLookup({ allowed: ALLOWED_PRIVATE_UPSTREAMS, own: OWN_HOSTS })
 const upstreamDispatcher = new Agent({
   headersTimeout: 0,
   bodyTimeout: 0,
-  connect: { timeout: 30_000 },
+  connect: { timeout: 30_000, lookup: guardedLookup },
 })
+// The token fetch keeps undici's default timers; only the lookup is guarded.
+const tokenDispatcher = new Agent({ connect: { timeout: 15_000, lookup: guardedLookup } })
+const upstreamFetch = (url, init) => guardedFetch(url, init, { allowed: ALLOWED_PRIVATE_UPSTREAMS, own: OWN_HOSTS })
 const MAX_ARG_BYTES = Number(process.env.ORCH_MAX_ARG_BYTES || 65536)
 const MAX_RESULT_BYTES = Number(process.env.ORCH_MAX_RESULT_BYTES || 200000)
 const STREAM_RESPONSES = process.env.ORCH_STREAM === 'true'
@@ -38,14 +58,20 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABA
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'mcp_tool_cache'
 const SUPABASE_INTEGRATIONS_TABLE = process.env.SUPABASE_INTEGRATIONS_TABLE || 'agent_integrations'
 const SUPABASE_INTEGRATIONS_CACHE_TTL_MS = Number(process.env.SUPABASE_INTEGRATIONS_CACHE_TTL_MS || 300000)
+// A row read that stalls becomes an error after this long (supabase-js retries included), so the
+// one shared read per id never holds every request for that id for minutes.
+const SUPABASE_READ_TIMEOUT_MS = Number(process.env.SUPABASE_READ_TIMEOUT_MS) || 10_000
 const AUTO_DISCOVER_UPSTREAMS = process.env.ORCH_AUTO_DISCOVER !== 'false'
 const UPSTREAMS = parseJson(process.env.MCP_UPSTREAMS || process.env.UPSTREAMS || '[]') || []
 const APIFY_DATASET_CACHE_TTL_MS = Number(process.env.APIFY_DATASET_CACHE_TTL_MS || 600000)
 // Every request but GET/HEAD /health must carry x-orchestrator-key equal to one of these
-// (comma-separated while rotating). Unset with a service key configured: every request is
-// refused, unless ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+// (comma-separated while rotating; an entry under 32 characters is ignored). Unset, or set with no
+// valid entry, with a service key configured: every request is refused, unless
+// ORCH_ALLOW_UNAUTHENTICATED=true (lib/resolve.js createInboundGuard).
+const inboundKeys = parseInboundKeys(process.env.ORCH_INBOUND_KEY)
 const inboundGuard = createInboundGuard({
-  keys: parseInboundKeys(process.env.ORCH_INBOUND_KEY),
+  keys: inboundKeys.keys,
+  ignoredKeys: inboundKeys.ignored,
   serviceKeyConfigured: Boolean(SUPABASE_KEY),
   allowUnauthenticated: process.env.ORCH_ALLOW_UNAUTHENTICATED === 'true',
 })
@@ -321,11 +347,12 @@ async function getOAuthToken(cacheKey, config) {
   if (scope) body.set('scope', scope)
   if (audience) body.set('audience', audience)
 
-  const response = await fetch(tokenUrl, {
+  const response = await upstreamFetch(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
     signal: AbortSignal.timeout(15000),
+    dispatcher: tokenDispatcher,
   })
 
   if (!response.ok) {
@@ -378,6 +405,7 @@ async function fetchIntegrationById(integrationId) {
     .from(SUPABASE_INTEGRATIONS_TABLE)
     .select('id,name,config,integration_type,is_active,is_verified,updated_at')
     .eq('id', integrationId)
+    .abortSignal(AbortSignal.timeout(SUPABASE_READ_TIMEOUT_MS))
     .maybeSingle()
   // A read error throws, so the resolver can tell it from a missing row.
   if (error) throw new Error(error.message || 'Integration lookup failed')
@@ -440,6 +468,7 @@ async function ensureUpstreamSession(upstream) {
       // Still continue — some servers may accept tools/call without init
     }
   } catch (initErr) {
+    if (initErr instanceof UpstreamRefusedError) throw initErr
     console.warn(`[orchestrator] initialize failed for ${upstream.name || upstream.url}: ${initErr instanceof Error ? initErr.message : 'unknown'}`)
     // Continue without session — stateless servers or wrappers may still work
     return null
@@ -793,7 +822,7 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
 
   let res
   try {
-    res = await fetch(upstream.url, {
+    res = await upstreamFetch(upstream.url, {
       method: 'POST',
       headers,
       body: JSON.stringify(message),
@@ -801,6 +830,7 @@ async function sendRpc(upstream, message, timeoutMs = DEFAULT_TIMEOUT_MS, sessio
       dispatcher: upstreamDispatcher,
     })
   } catch (err) {
+    if (err instanceof UpstreamRefusedError) throw err
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[MCP Orchestrator] upstream ${rpcLabel} FAILED after ${elapsed()} (${upstream.name || upstream.url}): ${msg}`)
     throw err
@@ -1148,7 +1178,23 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+/** A refused upstream answers JSON-RPC -32010 `upstream_refused` and one log line with the host and reason, never a credential. */
 async function dispatchRequest(req, body) {
+  try {
+    return await dispatchMethod(req, body)
+  } catch (err) {
+    const refused = refusalIn(err)
+    if (!refused) throw err
+    console.warn(`[MCP Orchestrator] upstream_refused ${logLabel(refused.host)}: ${logLabel(refused.reason)} (integration=${integrationLabelOf(req)})`)
+    // -32010: a plain server error. Not -32001 (the MCP SDK's RequestTimeout, which Nexus reads as
+    // "still running, retry") nor -32000/-32002/-32042. One generic message: the host and the reason
+    // stay in the log line. The outcome still differs from a name that does not resolve (that one
+    // fails as a fetch error), so a tenant can tell whether their own name resolved privately.
+    return { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32010, message: 'upstream_refused' } }
+  }
+}
+
+async function dispatchMethod(req, body) {
   if (!body || typeof body !== 'object') {
     return buildJsonRpcError(null, 'Invalid request body', -32600)
   }
@@ -1184,8 +1230,11 @@ async function dispatchRequest(req, body) {
 }
 
 server.listen(PORT, () => {
-  console.log(`[MCP Orchestrator] Listening on port ${PORT}`)
+  // The bound port, so PORT=0 (tests) says which one it got.
+  console.log(`[MCP Orchestrator] Listening on port ${server.address().port}`)
   console.log(`[MCP Orchestrator] Upstreams: ${UPSTREAMS.length}`)
+  console.log(`[MCP Orchestrator] Upstream SSRF guard on (at most ${MAX_REDIRECTS} redirects); private hosts allowed: ${ALLOWED_PRIVATE_UPSTREAMS.size ? Array.from(ALLOWED_PRIVATE_UPSTREAMS, ([host, ports]) => logLabel(ports ? `${host}:${[...ports].join('|')}` : `${host} (any port)`)).join(', ') : 'none'}; own hosts refused: ${OWN_HOSTS.size ? Array.from(OWN_HOSTS, logLabel).join(', ') : 'none set'}`)
+  if (inboundGuard.ignoredLine) console.warn(inboundGuard.ignoredLine)
   if (inboundGuard.mode === 'key') console.log(inboundGuard.startupLine)
   else console.warn(inboundGuard.startupLine)
 })
